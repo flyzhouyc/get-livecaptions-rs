@@ -128,8 +128,8 @@ impl Engine {
         Ok(())
     }
 
-    fn graceful_shutdown(&mut self) -> Result<()> {
-        let text = self.get_livecaptions()?;
+    async fn graceful_shutdown(&mut self) -> Result<()> {
+        let text = self.get_livecaptions().await?;
         self.save_current_captions(&text, true)?;
         Ok(())
     }
@@ -165,7 +165,7 @@ async fn main() {
                 log::info!("running checking, every 10s.");
                 if !is_livecaptions_running() {
                     println!("livecaptions is not running. program exiting.");
-                    let _ = engine.graceful_shutdown();
+                    let _ = engine.graceful_shutdown().await;
                     process::exit(0);
                 }
             },
@@ -177,7 +177,7 @@ async fn main() {
                 }
             },
             _ = &mut ctrl_c => {
-                let _ = engine.graceful_shutdown();
+                let _ = engine.graceful_shutdown().await;
                 process::exit(0);
             }
         };
