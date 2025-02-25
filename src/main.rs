@@ -78,6 +78,11 @@ impl Engine {
     }
 
     async fn translate_text(&self, text: &str) -> Result<String> {
+        if text.trim().is_empty() {
+            println!("Skipping empty text.");
+            return Ok(String::new());
+        }
+
         let client = reqwest::Client::new();
         let response = client.post(&self.api_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
