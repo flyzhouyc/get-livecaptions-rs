@@ -173,6 +173,7 @@ async fn main() {
                 log::info!("save content into file, every {} min.", args.interval);
                 let text = engine.get_livecaptions().await;
                 if let Ok(text) = text {
+                    println!("Translated Text: {}", text); // Print the translated text to the command line
                     engine.save_current_captions(&text, false).expect("save file failed.");
                 }
             },
