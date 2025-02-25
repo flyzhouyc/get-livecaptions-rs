@@ -94,6 +94,8 @@ impl Engine {
         Ok(translated_text)
     }
 
+    // Commenting out the save_current_captions function
+    /*
     fn save_current_captions(&mut self, current: &str, include_last_line: bool) -> Result<()> {
         use std::fs::OpenOptions;
         use std::io::prelude::*;
@@ -127,10 +129,12 @@ impl Engine {
         }
         Ok(())
     }
+    */
 
     async fn graceful_shutdown(&mut self) -> Result<()> {
         let text = self.get_livecaptions().await?;
-        self.save_current_captions(&text, true)?;
+        // Commenting out the call to save_current_captions
+        // self.save_current_captions(&text, true)?;
         Ok(())
     }
 }
@@ -174,7 +178,8 @@ async fn main() {
                 let text = engine.get_livecaptions().await;
                 if let Ok(text) = text {
                     println!("Translated Text: {}", text); // Print the translated text to the command line
-                    engine.save_current_captions(&text, false).expect("save file failed.");
+                    // Commenting out the call to save_current_captions
+                    // engine.save_current_captions(&text, false).expect("save file failed.");
                 }
             },
             _ = &mut ctrl_c => {
