@@ -72,6 +72,7 @@ impl Engine {
         let element = unsafe { self.automation.ElementFromHandle(window) }?;
         let text = unsafe { element.FindFirst(TreeScope_Descendants, &self.condition) }?;
         let text = unsafe { text.CurrentName() }?;
+        println!("Captured Text: {}", text); // Log the captured text
         let translated_text = self.translate_text(&text.to_string()).await?;
         Ok(translated_text)
     }
