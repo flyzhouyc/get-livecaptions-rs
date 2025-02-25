@@ -89,6 +89,8 @@ impl Engine {
             .await?;
 
         let response_text = response.text().await?;
+        println!("API Response: {}", response_text); // Log the API response
+
         let response_json: serde_json::Value = serde_json::from_str(&response_text)?;
         let translated_text = response_json["choices"][0]["text"].as_str().unwrap_or("").to_string();
         Ok(translated_text)
