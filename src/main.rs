@@ -9,7 +9,6 @@ use log::{error, info};
 use anyhow::Result;
 use reqwest;
 use serde_json;
-use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -68,12 +67,12 @@ impl Engine {
         }
     }
 
-    fn get_livecaptions(&self) -> Result<String> {
+    async fn get_livecaptions(&self) -> Result<String> {
         let window = unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None) };
         let element = unsafe { self.automation.ElementFromHandle(window) }?;
         let text = unsafe { element.FindFirst(TreeScope_Descendants, &self.condition) }?;
         let text = unsafe { text.CurrentName() }?;
-        let translated_text = self.translate_text(&text.to_string())?;
+        let translated_text = self.translate_text(&text.to_string()).await?;
         Ok(translated_text)
     }
 
@@ -172,7 +171,7 @@ async fn main() {
             },
             _ = writefile_timer.tick() => {
                 log::info!("save content into file, every {} min.", args.interval);
-                let text = engine.get_livecaptions();
+                let text = engine.get_livecaptions().await;
                 if let Ok(text) = text {
                     engine.save_current_captions(&text, false).expect("save file failed.");
                 }
