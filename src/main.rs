@@ -160,7 +160,7 @@ async fn main() {
     let mut engine = Engine::new(&args.file, args.api_url, args.model_name, args.api_key);
 
     let mut windows_timer = tokio::time::interval(Duration::from_secs(10));
-    let mut writefile_timer = tokio::time::interval(Duration::from_secs(args.interval as u64 * 60));
+    let mut writefile_timer = tokio::time::interval(Duration::from_secs(1)); // Change to 1-second interval
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
