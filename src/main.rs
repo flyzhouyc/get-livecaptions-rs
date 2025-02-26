@@ -5,7 +5,8 @@ use windows::{
 };
 use clap::Parser;
 use log::{error, info, warn};
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, anyhow};
+use std::io::{self, Write};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -22,7 +23,7 @@ struct Args {
 struct Engine {
     automation: IUIAutomation,
     condition: IUIAutomationCondition,
-    prebuffer: String,
+    previous_text: String,
 }
 
 impl Drop for Engine {
@@ -35,51 +36,81 @@ impl Drop for Engine {
 impl Engine {
     fn new() -> Result<Self> {
         unsafe { 
+            // 修复错误：正确处理HRESULT
             CoInitializeEx(None, COINIT_MULTITHREADED)
-                .context("Failed to initialize Windows COM")?;
+                .map_err(|e| anyhow!("Failed to initialize Windows COM: {:?}", e))?;
         }
 
         let automation: IUIAutomation = unsafe { 
             CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)
-                .context("Failed to initialize Windows Accessibility API")?
+                .map_err(|e| anyhow!("Failed to initialize Windows Accessibility API: {:?}", e))?
         };
         
         let condition = unsafe { 
             automation.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("CaptionsTextBlock"))
-                .context("Failed to create property condition")?
+                .map_err(|e| anyhow!("Failed to create property condition: {:?}", e))?
         };
         
         Ok(Self {
             automation,
             condition,
-            prebuffer: Default::default(),
+            previous_text: String::new(),
         })
     }
 
-    async fn get_livecaptions(&self) -> Result<String> {
+    async fn get_livecaptions(&mut self) -> Result<Option<String>> {
         let window = unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None) };
         if window.0 == 0 {
-            return Err(anyhow::anyhow!("Live Captions window not found"));
+            return Err(anyhow!("Live Captions window not found"));
         }
         
         let element = unsafe { self.automation.ElementFromHandle(window) }
-            .context("Failed to get element from window handle")?;
+            .map_err(|e| anyhow!("Failed to get element from window handle: {:?}", e))?;
             
         let text_element = unsafe { element.FindFirst(TreeScope_Descendants, &self.condition) }
-            .context("Failed to find captions text element")?;
+            .map_err(|e| anyhow!("Failed to find captions text element: {:?}", e))?;
             
-        let text = unsafe { text_element.CurrentName() }
-            .context("Failed to get text from element")?;
-            
-        Ok(text.to_string())
+        let current_text = unsafe { text_element.CurrentName() }
+            .map_err(|e| anyhow!("Failed to get text from element: {:?}", e))?
+            .to_string();
+        
+        // 如果文本为空或与上次相同，返回None
+        if current_text.is_empty() || current_text == self.previous_text {
+            return Ok(None);
+        }
+        
+        // 提取新增的文本行
+        let new_text = if self.previous_text.is_empty() {
+            current_text.clone()
+        } else {
+            // 寻找新增的内容
+            if current_text.starts_with(&self.previous_text) {
+                current_text[self.previous_text.len()..].trim_start().to_string()
+            } else {
+                // 如果旧文本不是新文本的前缀，可能是文本完全更新了
+                current_text.clone()
+            }
+        };
+        
+        // 更新上一次的文本
+        self.previous_text = current_text;
+        
+        if !new_text.is_empty() {
+            Ok(Some(new_text))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn graceful_shutdown(&mut self) -> Result<()> {
         info!("Performing graceful shutdown");
         match self.get_livecaptions().await {
-            Ok(text) => {
+            Ok(Some(text)) => {
                 info!("Final captions captured: {}", text);
-                // Any final processing of the text could go here
+                println!("\n> Final caption: {}", text);
+            }
+            Ok(None) => {
+                info!("No new captions at shutdown");
             }
             Err(err) => {
                 warn!("Could not capture final captions: {}", err);
@@ -119,6 +150,7 @@ async fn main() -> Result<()> {
     println!("  - Capture interval: {} seconds", args.capture_interval);
     println!("  - Check interval: {} seconds", args.check_interval);
     println!("Press Ctrl+C to exit");
+    println!("-----------------------------------");
     
     loop {
         tokio::select! {
@@ -135,12 +167,13 @@ async fn main() -> Result<()> {
             _ = capture_timer.tick() => {
                 info!("Capturing live captions");
                 match engine.get_livecaptions().await {
-                    Ok(text) => {
-                        if !text.is_empty() {
-                            println!("Captions: {}", text);
-                        } else {
-                            info!("No captions text available");
-                        }
+                    Ok(Some(text)) => {
+                        // 逐行显示字幕
+                        print!("> {}\n", text);
+                        io::stdout().flush().ok(); // 确保立即输出
+                    },
+                    Ok(None) => {
+                        info!("No new captions available");
                     },
                     Err(e) => {
                         warn!("Failed to capture captions: {}", e);
@@ -148,7 +181,7 @@ async fn main() -> Result<()> {
                 }
             },
             _ = &mut ctrl_c => {
-                println!("Received shutdown signal");
+                println!("\nReceived shutdown signal");
                 if let Err(e) = engine.graceful_shutdown().await {
                     error!("Error during shutdown: {}", e);
                     process::exit(1);
