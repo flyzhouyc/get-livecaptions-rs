@@ -37,8 +37,10 @@ impl Engine {
     fn new() -> Result<Self> {
         unsafe { 
             // 修复错误：正确处理HRESULT
-            CoInitializeEx(None, COINIT_MULTITHREADED)
-                .map_err(|e| anyhow!("Failed to initialize Windows COM: {:?}", e))?;
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if hr.is_err() {
+                return Err(anyhow!("Failed to initialize Windows COM: {:?}", hr));
+            }
         }
 
         let automation: IUIAutomation = unsafe { 
