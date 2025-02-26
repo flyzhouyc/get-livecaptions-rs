@@ -12,8 +12,8 @@ use std::io::{self, Write};
 #[command(version, about, long_about = None)]
 struct Args {
     /// Interval of seconds for capturing captions
-    #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..10))]
-    capture_interval: u64,
+    #[arg(short, long, default_value_t = 1.0, value_parser = clap::value_parser!(f64).range(0.1..10.0))]
+    capture_interval: f64,    
 
     /// Interval of seconds for checking if Live Captions is running
     #[arg(short = 'c', long, default_value_t = 10)]
@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
         .context("Failed to initialize engine")?;
 
     let mut windows_timer = tokio::time::interval(Duration::from_secs(args.check_interval));
-    let mut capture_timer = tokio::time::interval(Duration::from_secs(args.capture_interval));
+    let mut capture_timer = tokio::time::interval(Duration::from_secs_f64(args.capture_interval));
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
