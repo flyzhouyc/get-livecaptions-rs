@@ -1,14 +1,11 @@
 use tokio::time::Duration;
 use std::process;
-use chrono::prelude::*;
 use windows::{
     core::*, Win32::{System::Com::*, UI::{Accessibility::*, WindowsAndMessaging::*}},
 };
 use clap::Parser;
 use log::{error, info};
 use anyhow::Result;
-use reqwest;
-use serde_json;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -115,12 +112,12 @@ async fn main() {
     let mut engine = Engine::new();
 
     let mut windows_timer = tokio::time::interval(Duration::from_secs(10));
-    let mut writefile_timer = tokio::time::interval(Duration::from_secs(1)); // Change to 1-second interval
+    let mut capture_timer = tokio::time::interval(Duration::from_secs(1));
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
-    println!("get-livecaptions is running now, and save content into '{}', every {} min. ctrl-c for exit.", args.file, args.interval);
+    println!("Live captions monitoring started (Interval: {} minutes). Press ctrl-c to exit.", args.interval);
     loop {
         tokio::select! {
             _ = windows_timer.tick() => {
@@ -131,13 +128,10 @@ async fn main() {
                     process::exit(0);
                 }
             },
-            _ = writefile_timer.tick() => {
-                log::info!("save content into file, every {} min.", args.interval);
-                let text = engine.get_livecaptions().await;
-                if let Ok(text) = text {
-                    println!("Translated Text: {}", text); // Print the translated text to the command line
-                    // Commenting out the call to save_current_captions
-                    // engine.save_current_captions(&text, false).expect("save file failed.");
+            _ = capture_timer.tick() => {
+                log::info!("Capturing live captions...");
+                if let Ok(text) = engine.get_livecaptions().await {
+                    println!("Current Captions: {}", text);
                 }
             },
             _ = &mut ctrl_c => {
