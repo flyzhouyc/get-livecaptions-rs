@@ -12,7 +12,7 @@ use std::io::{self, Write};
 #[command(version, about, long_about = None)]
 struct Args {
     /// Interval of seconds for capturing captions
-    #[arg(short, long, default_value_t = 1.0, value_parser = 0.1..=3.0)]
+    #[arg(short, long, default_value_t = 1.0, value_parser = 0.1..=10.0)]
     capture_interval: f64,   
 
     /// Interval of seconds for checking if Live Captions is running
