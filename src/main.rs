@@ -1,11 +1,12 @@
 use tokio::time::{Duration, Instant};
 use std::process;
 use std::path::PathBuf;
+use std::sync::Arc;
 use windows::{
     core::*, Win32::System::Com::*, Win32::UI::{Accessibility::*, WindowsAndMessaging::*}, Win32::Foundation::HWND,
 };
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use thiserror::Error;
 use anyhow::{Result, Context};
 use std::io::{self, Write};
@@ -15,28 +16,67 @@ use std::fs;
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use async_trait::async_trait;
-use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+use tokio::task;
+use std::collections::HashMap;
 
-// Define custom error types for better error handling
+/// Main module documentation
+/// 
+/// This application captures text from accessibility interfaces (primarily Windows Live Captions),
+/// processes it, optionally translates it using various translation services, and outputs it
+/// to the terminal and/or a file.
+/// 
+/// # Features
+/// 
+/// - Captures text from Windows Live Captions using UI Automation
+/// - Processes the captured text to extract only new content
+/// - Optionally translates captions using various services (DeepL, OpenAI, etc.)
+/// - Displays processed text in the terminal and/or writes to a file
+/// - Configurable via JSON configuration file and command-line arguments
+/// - Adaptive capture intervals based on content availability
+/// 
+/// # Components
+/// 
+/// - Error handling: Custom error types for detailed error reporting
+/// - Translation services: Multiple translation service implementations
+/// - UI automation: Windows UI Automation interfacing with caching
+/// - Configuration: File-based JSON configuration with command-line overrides
+/// - Concurrency: Asynchronous design with worker tasks
+
+/// Define custom error types for better error handling
 #[derive(Debug, Error)]
 enum AppError {
+    /// Errors related to UI automation operations
     #[error("UI automation error: {0}")]
     UiAutomation(String),
     
+    /// Errors related to translation operations
     #[error("Translation error: {0}")]
     Translation(String),
     
+    /// Errors related to configuration operations
     #[error("Configuration error: {0}")]
     Config(String),
     
+    /// I/O errors
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// HTTP request errors
     #[error("HTTP request error: {0}")]
     Request(#[from] reqwest::Error),
 
+    /// COM errors
     #[error("COM error: {0}")]
     Com(String),
+    
+    /// Task errors
+    #[error("Task error: {0}")]
+    Task(String),
+    
+    /// Validation errors
+    #[error("Validation error: {0}")]
+    Validation(String),
 }
 
 // Implement From for windows errors
@@ -46,58 +86,324 @@ impl From<windows::core::Error> for AppError {
     }
 }
 
-// Define a trait for translation services
+/// Trait that defines a source of captions
+/// 
+/// This abstraction allows for different implementations of caption sources,
+/// not just Windows Live Captions.
+#[async_trait]
+trait CaptionSource: Send + Sync {
+    /// Initialize the caption source
+    async fn initialize(&mut self) -> Result<(), AppError>;
+    
+    /// Check if the caption source is available
+    async fn is_available(&self) -> bool;
+    
+    /// Get captions from the source
+    /// 
+    /// Returns None if no new captions are available
+    async fn get_captions(&mut self) -> Result<Option<String>, AppError>;
+    
+    /// Shutdown the caption source
+    async fn shutdown(&mut self) -> Result<(), AppError>;
+}
+
+/// Windows Live Captions implementation of the CaptionSource trait
+struct WindowsLiveCaptions {
+    automation: IUIAutomation,
+    condition: IUIAutomationCondition,
+    previous_text: String,
+    element_cache: LruCache<CacheKey, IUIAutomationElement>,
+    last_window_handle: HWND,
+    max_retries: usize,
+}
+
+impl Drop for WindowsLiveCaptions {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize(); }
+        info!("COM resources released");
+    }
+}
+
+#[async_trait]
+impl CaptionSource for WindowsLiveCaptions {
+    async fn initialize(&mut self) -> Result<(), AppError> {
+        debug!("Initializing Windows Live Captions source");
+        Ok(())
+    }
+    
+    async fn is_available(&self) -> bool {
+        unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None).0 != 0 }
+    }
+    
+    async fn get_captions(&mut self) -> Result<Option<String>, AppError> {
+        self.get_livecaptions_with_retry(self.max_retries).await
+    }
+    
+    async fn shutdown(&mut self) -> Result<(), AppError> {
+        debug!("Shutting down Windows Live Captions source");
+        Ok(())
+    }
+}
+
+impl WindowsLiveCaptions {
+    /// Creates a new WindowsLiveCaptions instance
+    /// 
+    /// # Errors
+    /// 
+    /// Returns an error if COM initialization or UI Automation setup fails
+    fn new() -> Result<Self, AppError> {
+        unsafe { 
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if hr.is_err() {
+                return Err(AppError::Com(format!("Failed to initialize Windows COM: {:?}", hr)));
+            }
+        }
+
+        let automation: IUIAutomation = unsafe { 
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)?
+        };
+        
+        let condition = unsafe { 
+            automation.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("CaptionsTextBlock"))?
+        };
+        
+        // Create a cache with a reasonable capacity
+        let cache_capacity = NonZeroUsize::new(10).unwrap();
+        
+        Ok(Self {
+            automation,
+            condition,
+            previous_text: String::new(),
+            element_cache: LruCache::new(cache_capacity),
+            last_window_handle: HWND(0),
+            max_retries: 3,
+        })
+    }
+
+    /// Extracts new text from the current text using diff detection
+    /// 
+    /// This function uses the similar library to compute differences between
+    /// the previous text and the current text, and extracts only the inserted portions.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `current` - The current text to compare with the previous text
+    /// 
+    /// # Returns
+    /// 
+    /// A String containing only the newly added text
+    fn extract_new_text<'a>(&self, current: &'a str) -> String {
+        if self.previous_text.is_empty() {
+            return current.to_string();
+        }
+        
+        // Use similar library to compute differences
+        let diff = TextDiff::from_chars(&self.previous_text, current);
+        
+        // Extract only the inserted parts
+        let mut new_text = String::new();
+        for change in diff.iter_all_changes() {
+            if change.tag() == ChangeTag::Insert {
+                new_text.push(change.value().chars().next().unwrap_or(' '));
+            }
+        }
+        
+        // If diff detection found no new content but texts differ, return entire text
+        if new_text.is_empty() && current != self.previous_text {
+            return current.to_string();
+        }
+        
+        new_text
+    }
+
+    /// Checks if a UI Automation element is still valid
+    fn is_element_valid(element: &IUIAutomationElement) -> bool {
+        // Try to get an attribute to check if the element is still valid
+        unsafe { 
+            element.CurrentProcessId().is_ok()
+        }
+    }
+
+    /// Gets the latest captions from Windows Live Captions
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(Some(String))` - New captions were found
+    /// * `Ok(None)` - No new captions were found
+    /// * `Err(AppError)` - An error occurred
+    async fn get_livecaptions(&mut self) -> Result<Option<String>, AppError> {
+        let window = unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None) };
+        if window.0 == 0 {
+            return Err(AppError::UiAutomation("Live Captions window not found".to_string()));
+        }
+        
+        // Check if window handle changed, clear cache if needed
+        let window_handle_value = window.0;
+        let window_changed = window_handle_value != self.last_window_handle.0;
+        if window_changed {
+            debug!("Window handle changed from {:?} to {:?}, refreshing UI elements", 
+                  self.last_window_handle.0, window_handle_value);
+            self.element_cache.clear();
+            self.last_window_handle = window;
+        }
+        
+        // Get or cache window element
+        let window_key = CacheKey::WindowElement(window_handle_value);
+        let window_element = if let Some(element) = self.element_cache.get(&window_key) {
+            if Self::is_element_valid(element) {
+                element.clone()
+            } else {
+                // Element invalid, remove from cache and get new one
+                self.element_cache.pop(&window_key);
+                let element = unsafe { self.automation.ElementFromHandle(window) }?;
+                self.element_cache.put(window_key, element.clone());
+                element
+            }
+        } else {
+            let element = unsafe { self.automation.ElementFromHandle(window) }?;
+            self.element_cache.put(window_key, element.clone());
+            element
+        };
+        
+        // Get or cache text element
+        let text_key = CacheKey::TextElement(window_handle_value);
+        let text_element = if let Some(element) = self.element_cache.get(&text_key) {
+            if Self::is_element_valid(element) {
+                element.clone()
+            } else {
+                // Element invalid, remove from cache and get new one
+                self.element_cache.pop(&text_key);
+                let element = unsafe { window_element.FindFirst(TreeScope_Descendants, &self.condition) }?;
+                self.element_cache.put(text_key, element.clone());
+                element
+            }
+        } else {
+            let element = unsafe { window_element.FindFirst(TreeScope_Descendants, &self.condition) }?;
+            self.element_cache.put(text_key, element.clone());
+            element
+        };
+        
+        // Get caption text from element
+        let current_text = unsafe { 
+            match text_element.CurrentName() {
+                Ok(name) => name.to_string(),
+                Err(e) => {
+                    // If getting text fails, element may be invalid; clear cache
+                    self.element_cache.pop(&window_key);
+                    self.element_cache.pop(&text_key);
+                    return Err(AppError::UiAutomation(format!("Failed to get text from element: {:?}", e)));
+                }
+            }
+        };
+        
+        // If text is empty or unchanged, return None
+        if current_text.is_empty() || current_text == self.previous_text {
+            return Ok(None);
+        }
+        
+        // Extract new content using diff detection
+        let new_text = self.extract_new_text(&current_text);
+        
+        // Update previous text
+        self.previous_text = current_text;
+        
+        if !new_text.is_empty() {
+            Ok(Some(new_text))
+        } else {
+            Ok(None)
+        }
+    }
+    
+    /// Gets captions with automatic retry on failure
+    /// 
+    /// # Arguments
+    /// 
+    /// * `max_retries` - Maximum number of retry attempts
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(Some(String))` - New captions were found
+    /// * `Ok(None)` - No new captions were found
+    /// * `Err(AppError)` - All retry attempts failed
+    async fn get_livecaptions_with_retry(&mut self, max_retries: usize) -> Result<Option<String>, AppError> {
+        let mut attempts = 0;
+        let mut last_error = None;
+        
+        while attempts < max_retries {
+            match self.get_livecaptions().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    attempts += 1;
+                    warn!("Attempt {}/{} failed: {}", attempts, max_retries, e);
+                    last_error = Some(e);
+                    if attempts < max_retries {
+                        // Exponential backoff
+                        let backoff_ms = 100 * 2u64.pow(attempts as u32);
+                        debug!("Retrying in {} ms", backoff_ms);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| AppError::UiAutomation("Unknown error after retries".to_string())))
+    }
+}
+
+/// Define a trait for translation services
 #[async_trait]
 trait TranslationService: Send + Sync {
+    /// Translates text to the target language
+    /// 
+    /// # Arguments
+    /// 
+    /// * `text` - The text to translate
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(String)` - The translated text
+    /// * `Err(AppError)` - Translation failed
     async fn translate(&self, text: &str) -> Result<String, AppError>;
+    
+    /// Gets the name of the translation service
+    fn get_name(&self) -> &str;
+    
+    /// Gets the target language code
+    fn get_target_language(&self) -> &str;
 }
 
-// 翻译API类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Translation API types supported by the application
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum TranslationApiType {
-    DeepL,    // DeepL API
-    Generic,  // 通用API
-    Demo,     // 演示模式
-    OpenAI,   // OpenAI 及兼容接口
+    /// DeepL translation API
+    DeepL,
+    /// Generic translation API
+    Generic,
+    /// Demo mode (no actual translation)
+    Demo,
+    /// OpenAI and compatible APIs
+    OpenAI,
 }
 
-// DeepL Translation Service
-struct DeepLTranslation {
-    api_key: String,
-    target_language: String,
-    client: reqwest::Client,
-    rate_limiter: RateLimiter,
+impl Default for TranslationApiType {
+    fn default() -> Self {
+        TranslationApiType::DeepL
+    }
 }
 
-// Generic Translation Service
-struct GenericTranslation {
-    api_key: String,
-    target_language: String,
-    client: reqwest::Client,
-    rate_limiter: RateLimiter,
-}
-
-// OpenAI Translation Service
-struct OpenAITranslation {
-    api_key: String,
-    target_language: String,
-    client: reqwest::Client,
-    api_url: String,
-    model: String,
-    system_prompt: String,
-    rate_limiter: RateLimiter,
-}
-
-// Demo Translation Service
-struct DemoTranslation;
-
-// Rate limiter to prevent API throttling
+/// Rate limiter to prevent API throttling
 struct RateLimiter {
     last_request: Option<Instant>,
     min_interval: Duration,
 }
 
 impl RateLimiter {
+    /// Creates a new rate limiter with the specified minimum interval
+    /// 
+    /// # Arguments
+    /// 
+    /// * `min_interval_ms` - Minimum interval between requests in milliseconds
     fn new(min_interval_ms: u64) -> Self {
         Self {
             last_request: None,
@@ -105,6 +411,7 @@ impl RateLimiter {
         }
     }
     
+    /// Waits if necessary to respect the minimum interval
     async fn wait(&mut self) {
         if let Some(last) = self.last_request {
             let elapsed = last.elapsed();
@@ -116,10 +423,50 @@ impl RateLimiter {
     }
 }
 
+/// DeepL Translation Service implementation
+struct DeepLTranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    rate_limiter: Mutex<RateLimiter>,
+}
+
+/// Generic Translation Service implementation
+struct GenericTranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    rate_limiter: Mutex<RateLimiter>,
+}
+
+/// OpenAI Translation Service implementation
+struct OpenAITranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    api_url: String,
+    model: String,
+    system_prompt: String,
+    rate_limiter: Mutex<RateLimiter>,
+}
+
+/// Demo Translation Service implementation
+struct DemoTranslation {
+    target_language: String,
+}
+
 #[async_trait]
 impl TranslationService for DemoTranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
-        Ok(format!("翻译: {}", text))
+        Ok(format!("[{} Translation]: {}", self.target_language, text))
+    }
+    
+    fn get_name(&self) -> &str {
+        "Demo"
+    }
+    
+    fn get_target_language(&self) -> &str {
+        &self.target_language
     }
 }
 
@@ -127,9 +474,9 @@ impl TranslationService for DemoTranslation {
 impl TranslationService for DeepLTranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         // Rate limiting
-        self.rate_limiter.wait().await;
+        self.rate_limiter.lock().await.wait().await;
         
-        // DeepL API 调用 (免费版)
+        // DeepL API call (free version)
         let url = "https://api-free.deepl.com/v2/translate";
         
         let response = self.client.post(url)
@@ -137,7 +484,7 @@ impl TranslationService for DeepLTranslation {
             .form(&[
                 ("text", text),
                 ("target_lang", &self.target_language),
-                ("source_lang", "EN"), // 假设源语言为英语，也可以设置为"auto"
+                ("source_lang", "EN"), // Assume source language is English, could be "auto"
             ])
             .send()
             .await
@@ -167,15 +514,23 @@ impl TranslationService for DeepLTranslation {
             Err(AppError::Translation("Empty translation result from DeepL".to_string()))
         }
     }
+    
+    fn get_name(&self) -> &str {
+        "DeepL"
+    }
+    
+    fn get_target_language(&self) -> &str {
+        &self.target_language
+    }
 }
 
 #[async_trait]
 impl TranslationService for GenericTranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         // Rate limiting
-        self.rate_limiter.wait().await;
+        self.rate_limiter.lock().await.wait().await;
         
-        // 通用API调用
+        // Generic API call
         let url = "https://translation-api.example.com/translate";
         
         let response = self.client.post(url)
@@ -197,11 +552,19 @@ impl TranslationService for GenericTranslation {
             .await
             .map_err(|e| AppError::Translation(format!("Failed to parse translation response: {}", e)))?;
                 
-        // 根据API响应格式提取翻译结果
+        // Extract translation result based on API response format
         result.get("translated_text")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| AppError::Translation("Invalid translation response format".to_string()))
+    }
+    
+    fn get_name(&self) -> &str {
+        "Generic"
+    }
+    
+    fn get_target_language(&self) -> &str {
+        &self.target_language
     }
 }
 
@@ -209,9 +572,9 @@ impl TranslationService for GenericTranslation {
 impl TranslationService for OpenAITranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         // Rate limiting
-        self.rate_limiter.wait().await;
+        self.rate_limiter.lock().await.wait().await;
         
-        // 构建请求体
+        // Construct request body
         let request_body = serde_json::json!({
             "model": self.model,
             "messages": [
@@ -227,7 +590,7 @@ impl TranslationService for OpenAITranslation {
             "temperature": 0.3
         });
         
-        // 发送请求
+        // Send request
         let response = self.client.post(&self.api_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -240,7 +603,7 @@ impl TranslationService for OpenAITranslation {
             return Err(AppError::Translation(format!("OpenAI API error: {}", response.status())));
         }
         
-        // 解析响应
+        // Parse response
         #[derive(Deserialize)]
         struct OpenAIResponse {
             choices: Vec<Choice>,
@@ -266,9 +629,17 @@ impl TranslationService for OpenAITranslation {
             Err(AppError::Translation("Empty translation result from OpenAI".to_string()))
         }
     }
+    
+    fn get_name(&self) -> &str {
+        "OpenAI"
+    }
+    
+    fn get_target_language(&self) -> &str {
+        &self.target_language
+    }
 }
 
-// Factory function to create the appropriate translation service
+/// Factory function to create the appropriate translation service
 fn create_translation_service(
     api_key: String,
     target_language: String,
@@ -279,14 +650,16 @@ fn create_translation_service(
 ) -> Arc<dyn TranslationService> {
     match api_type {
         TranslationApiType::Demo => {
-            Arc::new(DemoTranslation)
+            Arc::new(DemoTranslation {
+                target_language,
+            })
         },
         TranslationApiType::DeepL => {
             Arc::new(DeepLTranslation {
                 api_key,
                 target_language,
                 client: reqwest::Client::new(),
-                rate_limiter: RateLimiter::new(500), // 500ms between requests
+                rate_limiter: Mutex::new(RateLimiter::new(500)), // 500ms between requests
             })
         },
         TranslationApiType::Generic => {
@@ -294,7 +667,7 @@ fn create_translation_service(
                 api_key,
                 target_language,
                 client: reqwest::Client::new(),
-                rate_limiter: RateLimiter::new(500),
+                rate_limiter: Mutex::new(RateLimiter::new(500)),
             })
         },
         TranslationApiType::OpenAI => {
@@ -307,69 +680,95 @@ fn create_translation_service(
                 system_prompt: openai_system_prompt.unwrap_or_else(|| 
                     "You are a translator. Translate the following text to the target language. Only respond with the translation, no explanations.".to_string()
                 ),
-                rate_limiter: RateLimiter::new(1000), // OpenAI might need more time between requests
+                rate_limiter: Mutex::new(RateLimiter::new(1000)), // OpenAI might need more time between requests
             })
         },
     }
 }
 
-/// 配置文件结构
+/// Configuration file structure
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
-    // 基本设置
-    capture_interval: f64,  // 捕获间隔（秒）
-    check_interval: u64,    // 检查 Live Captions 是否运行的间隔（秒）
+    // Basic settings
+    #[serde(default = "default_capture_interval")]
+    capture_interval: f64,  // Capture interval (seconds)
     
-    // 高级设置
-    min_interval: f64,      // 最小捕获间隔（秒）
-    max_interval: f64,      // 最大捕获间隔（秒）
-    max_text_length: usize, // 存储文本的最大长度
+    #[serde(default = "default_check_interval")]
+    check_interval: u64,    // Interval to check if Live Captions is running (seconds)
     
-    // 输出设置
-    output_file: Option<String>, // 输出文件路径（可选）
+    // Advanced settings
+    #[serde(default = "default_min_interval")]
+    min_interval: f64,      // Minimum capture interval (seconds)
     
-    // 翻译设置
-    enable_translation: bool,    // 是否启用翻译
-    translation_api_key: Option<String>, // 翻译API密钥（可选）
-    translation_api_type: Option<String>, // 翻译API类型（"deepl", "generic", "demo", "openai"）
-    target_language: Option<String>,    // 目标语言（可选）
+    #[serde(default = "default_max_interval")]
+    max_interval: f64,      // Maximum capture interval (seconds)
     
-    // OpenAI 相关配置
-    openai_api_url: Option<String>,     // API 端点 URL
-    openai_model: Option<String>,       // 模型名称
-    openai_system_prompt: Option<String>, // 系统提示词
+    #[serde(default = "default_max_text_length")]
+    max_text_length: usize, // Maximum length of stored text
+    
+    // Output settings
+    output_file: Option<String>, // Output file path (optional)
+    
+    // Translation settings
+    #[serde(default)]
+    enable_translation: bool,    // Whether to enable translation
+    translation_api_key: Option<String>, // Translation API key (optional)
+    #[serde(default)]
+    translation_api_type: TranslationApiType, // Translation API type
+    target_language: Option<String>,    // Target language (optional)
+    
+    // OpenAI related configuration
+    openai_api_url: Option<String>,     // API endpoint URL
+    openai_model: Option<String>,       // Model name
+    openai_system_prompt: Option<String>, // System prompt
+    
+    // Concurrency settings
+    #[serde(default = "default_worker_threads")]
+    worker_threads: usize,       // Number of worker threads for processing
+    
+    // UI automation settings
+    #[serde(default = "default_caption_source")]
+    caption_source: String,      // Caption source type
+    
+    // Custom window settings (for non-Windows Live Captions sources)
+    custom_window_class: Option<String>,  // Custom window class name
+    custom_window_name: Option<String>,   // Custom window name
+    custom_element_id: Option<String>,    // Custom element ID
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            capture_interval: 1.0,
-            check_interval: 10,
-            min_interval: 0.5,
-            max_interval: 3.0,
-            max_text_length: 10000,
-            output_file: None,
-            enable_translation: false,
-            translation_api_key: None,
-            translation_api_type: Some("deepl".to_string()), // 默认使用DeepL API
-            target_language: None,
-            openai_api_url: None,
-            openai_model: None,
-            openai_system_prompt: None,
-        }
-    }
-}
+// Default value functions for serde
+fn default_capture_interval() -> f64 { 1.0 }
+fn default_check_interval() -> u64 { 10 }
+fn default_min_interval() -> f64 { 0.5 }
+fn default_max_interval() -> f64 { 3.0 }
+fn default_max_text_length() -> usize { 10000 }
+fn default_worker_threads() -> usize { 2 }
+fn default_caption_source() -> String { "windows_live_captions".to_string() }
 
 impl Config {
-    // 从文件加载配置
+    /// Loads configuration from a file, creating a default if it doesn't exist
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - Path to the configuration file
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(Config)` - The loaded configuration
+    /// * `Err(AppError)` - An error occurred while loading the configuration
     fn load(path: &PathBuf) -> Result<Self, AppError> {
         if path.exists() {
             let content = fs::read_to_string(path)
                 .map_err(|e| AppError::Config(format!("Failed to read config file: {:?}: {}", path, e)))?;
-            serde_json::from_str(&content)
-                .map_err(|e| AppError::Config(format!("Failed to parse config file: {:?}: {}", path, e)))
+            let config: Self = serde_json::from_str(&content)
+                .map_err(|e| AppError::Config(format!("Failed to parse config file: {:?}: {}", path, e)))?;
+            
+            // Validate configuration after loading
+            config.validate()?;
+            
+            Ok(config)
         } else {
-            // 如果配置文件不存在，创建默认配置
+            // If the configuration file doesn't exist, create a default configuration
             let config = Config::default();
             let content = serde_json::to_string_pretty(&config)
                 .map_err(|e| AppError::Config(format!("Failed to serialize default config: {}", e)))?;
@@ -380,8 +779,20 @@ impl Config {
         }
     }
     
-    // 保存配置到文件
+    /// Saves configuration to a file
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - Path to save the configuration file to
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(())` - The configuration was saved successfully
+    /// * `Err(AppError)` - An error occurred while saving the configuration
     fn save(&self, path: &PathBuf) -> Result<(), AppError> {
+        // Validate before saving
+        self.validate()?;
+        
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| AppError::Config(format!("Failed to serialize config: {}", e)))?;
         fs::write(path, content)
@@ -389,8 +800,110 @@ impl Config {
         info!("Saved config to {:?}", path);
         Ok(())
     }
+    
+    /// Validates the configuration values
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(())` - The configuration is valid
+    /// * `Err(AppError)` - The configuration is invalid
+    fn validate(&self) -> Result<(), AppError> {
+        // Validate capture intervals
+        if self.capture_interval <= 0.0 {
+            return Err(AppError::Validation("Capture interval must be positive".to_string()));
+        }
+        
+        if self.min_interval <= 0.0 {
+            return Err(AppError::Validation("Minimum interval must be positive".to_string()));
+        }
+        
+        if self.max_interval <= 0.0 {
+            return Err(AppError::Validation("Maximum interval must be positive".to_string()));
+        }
+        
+        if self.min_interval > self.max_interval {
+            return Err(AppError::Validation("Minimum interval cannot be greater than maximum interval".to_string()));
+        }
+        
+        // Validate check interval
+        if self.check_interval == 0 {
+            return Err(AppError::Validation("Check interval cannot be zero".to_string()));
+        }
+        
+        // Validate text length
+        if self.max_text_length == 0 {
+            return Err(AppError::Validation("Maximum text length cannot be zero".to_string()));
+        }
+        
+        // Validate worker threads
+        if self.worker_threads == 0 {
+            return Err(AppError::Validation("Worker threads cannot be zero".to_string()));
+        }
+        
+        // Validate translation settings
+        if self.enable_translation {
+            if self.translation_api_type != TranslationApiType::Demo && self.translation_api_key.is_none() {
+                return Err(AppError::Validation("Translation API key is required when translation is enabled".to_string()));
+            }
+            
+            if self.target_language.is_none() {
+                return Err(AppError::Validation("Target language is required when translation is enabled".to_string()));
+            }
+            
+            // Validate OpenAI specific settings
+            if self.translation_api_type == TranslationApiType::OpenAI {
+                if self.openai_model.is_none() {
+                    warn!("No OpenAI model specified, will use default");
+                }
+            }
+        }
+        
+        // Validate caption source
+        if self.caption_source.is_empty() {
+            return Err(AppError::Validation("Caption source cannot be empty".to_string()));
+        }
+        
+        // Validate custom window settings if needed
+        if self.caption_source == "custom" {
+            if self.custom_window_class.is_none() && self.custom_window_name.is_none() {
+                return Err(AppError::Validation("Custom caption source requires either window class or window name".to_string()));
+            }
+            
+            if self.custom_element_id.is_none() {
+                return Err(AppError::Validation("Custom caption source requires element ID".to_string()));
+            }
+        }
+        
+        Ok(())
+    }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            capture_interval: default_capture_interval(),
+            check_interval: default_check_interval(),
+            min_interval: default_min_interval(),
+            max_interval: default_max_interval(),
+            max_text_length: default_max_text_length(),
+            output_file: None,
+            enable_translation: false,
+            translation_api_key: None,
+            translation_api_type: TranslationApiType::default(),
+            target_language: None,
+            openai_api_url: None,
+            openai_model: None,
+            openai_system_prompt: None,
+            worker_threads: default_worker_threads(),
+            caption_source: default_caption_source(),
+            custom_window_class: None,
+            custom_window_name: None,
+            custom_element_id: None,
+        }
+    }
+}
+
+/// Command line arguments structure
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -409,237 +922,339 @@ struct Args {
     /// Path to output file
     #[arg(short = 'o', long)]
     output_file: Option<String>,
+    
+    /// Whether to enable translation
+    #[arg(short = 't', long)]
+    enable_translation: Option<bool>,
+    
+    /// Target language for translation
+    #[arg(short = 'l', long)]
+    target_language: Option<String>,
+    
+    /// Number of worker threads
+    #[arg(short = 'w', long)]
+    worker_threads: Option<usize>,
+    
+    /// Caption source (windows_live_captions, custom)
+    #[arg(short = 's', long)]
+    caption_source: Option<String>,
 }
 
-// 用于缓存的键类型
+/// Keys for UI element caching
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CacheKey {
-    WindowElement(isize), // 窗口句柄的值作为键
-    TextElement(isize),   // 窗口句柄的值作为键
+    /// Window element cache key
+    WindowElement(isize), // Window handle value as key
+    /// Text element cache key
+    TextElement(isize),   // Window handle value as key
 }
 
+/// Main engine for the caption process
 struct Engine {
-    automation: IUIAutomation,
-    condition: IUIAutomationCondition,
-    previous_text: String,
-    displayed_text: String, // 用于跟踪显示在终端的文本
-    element_cache: LruCache<CacheKey, IUIAutomationElement>, // 使用LRU缓存存储UI元素
-    last_window_handle: HWND, // 存储上次的窗口句柄
-    consecutive_empty_captures: usize, // 连续空捕获的次数
-    adaptive_interval: f64, // 自适应捕获间隔
-    min_interval: f64, // 最小捕获间隔
-    max_interval: f64, // 最大捕获间隔
-    max_text_length: usize, // 存储文本的最大长度
-}
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        unsafe { CoUninitialize(); }
-        info!("COM resources released");
-    }
+    config: Config,
+    displayed_text: String, // Text displayed in the terminal
+    caption_source: Arc<Mutex<dyn CaptionSource + Send + Sync>>,
+    translation_service: Option<Arc<dyn TranslationService>>,
+    consecutive_empty_captures: usize, // Count of consecutive empty captures
+    adaptive_interval: f64, // Adaptive capture interval
+    output_file: Option<fs::File>, // Output file handle
 }
 
 impl Engine {
-    fn new() -> Result<Self, AppError> {
-        unsafe { 
-            // 修复错误：正确处理HRESULT
-            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-            if hr.is_err() {
-                return Err(AppError::Com(format!("Failed to initialize Windows COM: {:?}", hr)));
+    /// Creates and initializes a new engine instance
+    /// 
+    /// # Arguments
+    /// 
+    /// * `config` - The application configuration
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(Engine)` - The initialized engine
+    /// * `Err(AppError)` - An error occurred during initialization
+    async fn new(config: Config) -> Result<Self, AppError> {
+        debug!("Initializing engine with config: {:?}", config);
+        
+        // Create caption source based on configuration
+        let caption_source: Arc<Mutex<dyn CaptionSource + Send + Sync>> = match config.caption_source.as_str() {
+            "windows_live_captions" => {
+                let source = WindowsLiveCaptions::new()?;
+                Arc::new(Mutex::new(source))
+            },
+            "custom" => {
+                return Err(AppError::Config("Custom caption source not yet implemented".to_string()));
+            },
+            _ => {
+                return Err(AppError::Config(format!("Unknown caption source: {}", config.caption_source)));
             }
-        }
-
-        let automation: IUIAutomation = unsafe { 
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)?
         };
         
-        let condition = unsafe { 
-            automation.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("CaptionsTextBlock"))?
+        // Initialize the caption source
+        caption_source.lock().await.initialize().await?;
+        
+        // Create translation service if enabled
+        let translation_service = if config.enable_translation {
+            if let Some(api_key) = &config.translation_api_key {
+                // Ensure target language is set
+                let target_lang = config.target_language.clone().unwrap_or_else(|| {
+                    match config.translation_api_type {
+                        TranslationApiType::DeepL => "ZH".to_string(), // DeepL uses uppercase language codes
+                        TranslationApiType::OpenAI => "Chinese".to_string(), // OpenAI uses natural language descriptions
+                        _ => "zh-CN".to_string(),
+                    }
+                });
+                
+                info!("Initializing translation service with {:?} API", config.translation_api_type);
+                Some(create_translation_service(
+                    api_key.clone(),
+                    target_lang,
+                    config.translation_api_type,
+                    config.openai_api_url.clone(),
+                    config.openai_model.clone(),
+                    config.openai_system_prompt.clone()
+                ))
+            } else if config.translation_api_type == TranslationApiType::Demo {
+                // Demo mode doesn't need an API key
+                let target_lang = config.target_language.clone().unwrap_or_else(|| "zh-CN".to_string());
+                Some(create_translation_service(
+                    "".to_string(),
+                    target_lang,
+                    TranslationApiType::Demo,
+                    None,
+                    None,
+                    None
+                ))
+            } else {
+                warn!("Translation enabled but no API key provided");
+                None
+            }
+        } else {
+            None
         };
         
-        // 默认配置值
-        let default_min_interval = 0.5; // 最小捕获间隔为0.5秒
-        let default_max_interval = 3.0; // 最大捕获间隔为3秒
-        let default_max_text_length = 10000; // 最大文本长度为10000字符
-        
-        // 创建一个容量为10的LRU缓存
-        let cache_capacity = NonZeroUsize::new(10).unwrap();
+        // Create output file if configured
+        let output_file = if let Some(path) = &config.output_file {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("Failed to open output file: {}", path))?;
+            info!("Writing output to file: {}", path);
+            Some(file)
+        } else {
+            None
+        };
         
         Ok(Self {
-            automation,
-            condition,
-            previous_text: String::new(),
             displayed_text: String::new(),
-            element_cache: LruCache::new(cache_capacity),
-            last_window_handle: HWND(0),
+            caption_source,
+            translation_service,
             consecutive_empty_captures: 0,
-            adaptive_interval: default_min_interval,
-            min_interval: default_min_interval,
-            max_interval: default_max_interval,
-            max_text_length: default_max_text_length,
+            adaptive_interval: config.min_interval,
+            output_file,
+            config,
         })
     }
-
-    // 使用 similar 库的差异检测算法
-    fn extract_new_text<'a>(&self, current: &'a str) -> String {
-        if self.previous_text.is_empty() {
-            return current.to_string();
-        }
+    
+    /// Main loop for the engine
+    /// 
+    /// This function handles the main event loop and coordinates
+    /// the capture, processing, and output tasks.
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(())` - The engine ran successfully until shutdown
+    /// * `Err(AppError)` - An error occurred during the run
+    async fn run(&mut self) -> Result<(), AppError> {
+        info!("Starting engine main loop");
         
-        // 使用 similar 库计算差异
-        let diff = TextDiff::from_chars(&self.previous_text, current);
+        // Create channels for communication between tasks
+        let (caption_tx, mut caption_rx) = mpsc::channel::<String>(32);
+        let (processed_tx, mut processed_rx) = mpsc::channel::<String>(32);
         
-        // 只提取添加的部分
-        let mut new_text = String::new();
-        for change in diff.iter_all_changes() {
-            if change.tag() == ChangeTag::Insert {
-                new_text.push(change.value().chars().next().unwrap_or(' '));
-            }
-        }
+        // Clone references for the worker tasks
+        let caption_source = self.caption_source.clone();
+        let translation_service = self.translation_service.clone();
+        let config = self.config.clone();
         
-        // 如果差异检测没有发现新内容但文本确实不同，则返回整个文本
-        if new_text.is_empty() && current != self.previous_text {
-            return current.to_string();
-        }
-        
-        new_text
-    }
-
-    // 检查元素是否有效
-    fn is_element_valid(element: &IUIAutomationElement) -> bool {
-        // 尝试获取一个属性来检查元素是否仍然有效
-        unsafe { 
-            element.CurrentProcessId().is_ok()
-        }
-    }
-
-    async fn get_livecaptions(&mut self) -> Result<Option<String>, AppError> {
-        let window = unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None) };
-        if window.0 == 0 {
-            return Err(AppError::UiAutomation("Live Captions window not found".to_string()));
-        }
-        
-        // 检查窗口是否发生变化，只有需要时才清理缓存
-        let window_handle_value = window.0;
-        let window_changed = window_handle_value != self.last_window_handle.0;
-        if window_changed {
-            info!("Window handle changed from {:?} to {:?}, refreshing UI elements", 
-                  self.last_window_handle.0, window_handle_value);
-            // 清除所有缓存的元素
-            self.element_cache.clear();
-            self.last_window_handle = window;
-        }
-        
-        // 获取或缓存窗口元素
-        let window_key = CacheKey::WindowElement(window_handle_value);
-        let window_element = if let Some(element) = self.element_cache.get(&window_key) {
-            if Self::is_element_valid(element) {
-                element.clone()
-            } else {
-                // 元素无效，从缓存中移除并获取新元素
-                self.element_cache.pop(&window_key);
-                let element = unsafe { self.automation.ElementFromHandle(window) }?;
-                self.element_cache.put(window_key, element.clone());
-                element
-            }
-        } else {
-            let element = unsafe { self.automation.ElementFromHandle(window) }?;
-            self.element_cache.put(window_key, element.clone());
-            element
-        };
-        
-        // 获取或缓存文本元素
-        let text_key = CacheKey::TextElement(window_handle_value);
-        let text_element = if let Some(element) = self.element_cache.get(&text_key) {
-            if Self::is_element_valid(element) {
-                element.clone()
-            } else {
-                // 元素无效，从缓存中移除并获取新元素
-                self.element_cache.pop(&text_key);
-                let element = unsafe { window_element.FindFirst(TreeScope_Descendants, &self.condition) }?;
-                self.element_cache.put(text_key, element.clone());
-                element
-            }
-        } else {
-            let element = unsafe { window_element.FindFirst(TreeScope_Descendants, &self.condition) }?;
-            self.element_cache.put(text_key, element.clone());
-            element
-        };
-        
-        // 从文本元素获取字幕内容
-        let current_text = unsafe { 
-            match text_element.CurrentName() {
-                Ok(name) => name.to_string(),
-                Err(e) => {
-                    // 如果获取文本失败，可能是元素已失效，清除缓存以便下次重新获取
-                    self.element_cache.pop(&window_key);
-                    self.element_cache.pop(&text_key);
-                    return Err(AppError::UiAutomation(format!("Failed to get text from element: {:?}", e)));
+        // Spawn caption capture task
+        let capture_handle = task::spawn(async move {
+            let mut adaptive_interval = config.min_interval;
+            let mut consecutive_empty = 0;
+            
+            let mut capture_timer = tokio::time::interval(Duration::from_secs_f64(config.capture_interval));
+            
+            loop {
+                // Wait for the next tick
+                capture_timer.tick().await;
+                
+                // Get captions
+                let mut source = caption_source.lock().await;
+                match source.get_captions().await {
+                    Ok(Some(text)) => {
+                        debug!("Captured new text: {}", text);
+                        if caption_tx.send(text).await.is_err() {
+                            warn!("Failed to send captured text to processor");
+                            break;
+                        }
+                        
+                        // Reset consecutive empty counter and adaptive interval
+                        consecutive_empty = 0;
+                        adaptive_interval = config.min_interval;
+                        capture_timer = tokio::time::interval(Duration::from_secs_f64(adaptive_interval));
+                    },
+                    Ok(None) => {
+                        debug!("No new captions available");
+                        // Gradually increase interval on consecutive empty captures
+                        consecutive_empty += 1;
+                        if consecutive_empty > 5 {
+                            adaptive_interval = (adaptive_interval * 1.2).min(config.max_interval);
+                            debug!("Adjusting capture interval to {} seconds", adaptive_interval);
+                            capture_timer = tokio::time::interval(Duration::from_secs_f64(adaptive_interval));
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to capture captions: {}", e);
+                        // Don't break on errors, continue trying
+                    }
+                }
+                
+                // Check if source is still available
+                if !source.is_available().await {
+                    error!("Caption source is no longer available");
+                    break;
                 }
             }
-        };
+        });
         
-        // 如果文本为空或与上次相同，返回None
-        if current_text.is_empty() || current_text == self.previous_text {
-            return Ok(None);
+        // Spawn processor tasks
+        let mut processor_handles = Vec::new();
+        for id in 0..self.config.worker_threads {
+            let processor_tx = processed_tx.clone();
+            let mut processor_rx = caption_rx.clone();
+            let translation = translation_service.clone();
+            
+            let handle = task::spawn(async move {
+                debug!("Starting processor task {}", id);
+                while let Some(text) = processor_rx.recv().await {
+                    // Process text (translate if enabled)
+                    let processed = match &translation {
+                        Some(service) => {
+                            match service.translate(&text).await {
+                                Ok(translated) => {
+                                    debug!("Translated text: {} -> {}", text, translated);
+                                    format!("{} [{}]", text, translated)
+                                },
+                                Err(e) => {
+                                    warn!("Translation failed: {}", e);
+                                    text
+                                }
+                            }
+                        },
+                        None => text,
+                    };
+                    
+                    // Send processed text
+                    if processor_tx.send(processed).await.is_err() {
+                        warn!("Failed to send processed text to output");
+                        break;
+                    }
+                }
+                debug!("Processor task {} exiting", id);
+            });
+            
+            processor_handles.push(handle);
         }
         
-        // 使用优化的文本差异检测算法提取新增内容
-        let new_text = self.extract_new_text(&current_text);
+        // Initialize checking timer
+        let mut check_timer = tokio::time::interval(Duration::from_secs(self.config.check_interval));
         
-        // 更新上一次的文本
-        self.previous_text = current_text;
+        // Set up Ctrl+C handler
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
         
-        if !new_text.is_empty() {
-            Ok(Some(new_text))
-        } else {
-            Ok(None)
+        println!("Live captions monitoring started:");
+        println!("  - Capture interval: {} seconds", self.config.capture_interval);
+        println!("  - Check interval: {} seconds", self.config.check_interval);
+        if self.config.enable_translation {
+            println!("  - Translation enabled: {}", self.translation_service.as_ref().map_or("No", |s| s.get_name()));
+            println!("  - Target language: {}", self.translation_service.as_ref().map_or("None", |s| s.get_target_language()));
+        }
+        if self.output_file.is_some() {
+            println!("  - Writing to file: {}", self.config.output_file.as_deref().unwrap());
+        }
+        println!("  - Worker threads: {}", self.config.worker_threads);
+        println!("Press Ctrl+C to exit");
+        println!("-----------------------------------");
+        
+        // Main event loop
+        loop {
+            tokio::select! {
+                _ = check_timer.tick() => {
+                    info!("Checking if caption source is available");
+                    let source = self.caption_source.lock().await;
+                    if !source.is_available().await {
+                        error!("Caption source is no longer available. Program exiting.");
+                        drop(source); // Release the lock before shutdown
+                        self.graceful_shutdown().await?;
+                        return Err(AppError::UiAutomation("Caption source not available".to_string()));
+                    }
+                },
+                Some(processed_text) = processed_rx.recv() => {
+                    // Append processed text to displayed text
+                    self.displayed_text.push_str(&processed_text);
+                    
+                    // Limit text length
+                    self.limit_text_length();
+                    
+                    // Display text
+                    Self::display_text(&self.displayed_text)?;
+                    
+                    // Write to output file if configured
+                    if let Some(file) = &mut self.output_file {
+                        if let Err(e) = writeln!(file, "{}", processed_text) {
+                            warn!("Failed to write to output file: {}", e);
+                        }
+                    }
+                },
+                _ = &mut ctrl_c => {
+                    println!("\nReceived shutdown signal");
+                    self.graceful_shutdown().await?;
+                    
+                    // Cancel tasks
+                    capture_handle.abort();
+                    for handle in processor_handles {
+                        handle.abort();
+                    }
+                    
+                    info!("Program terminated successfully");
+                    return Ok(());
+                }
+            };
         }
     }
     
-    // 添加重试逻辑
-    async fn get_livecaptions_with_retry(&mut self, max_retries: usize) -> Result<Option<String>, AppError> {
-        let mut attempts = 0;
-        let mut last_error = None;
-        
-        while attempts < max_retries {
-            match self.get_livecaptions().await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    attempts += 1;
-                    warn!("Attempt {}/{} failed: {}", attempts, max_retries, e);
-                    last_error = Some(e);
-                    if attempts < max_retries {
-                        // 指数退避
-                        let backoff_ms = 100 * 2u64.pow(attempts as u32);
-                        info!("Retrying in {} ms", backoff_ms);
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    }
-                }
-            }
-        }
-        
-        Err(last_error.unwrap_or_else(|| AppError::UiAutomation("Unknown error after retries".to_string())))
-    }
-
-    // 改进的文本长度限制方法
+    /// Limits text length to prevent excessive memory use
+    /// 
+    /// This method ensures that the displayed text stays within the configured
+    /// maximum length by removing older sentences when necessary.
     fn limit_text_length(&mut self) {
-        if self.displayed_text.len() > self.max_text_length {
-            // 按句子分割文本
+        if self.displayed_text.len() > self.config.max_text_length {
+            // Split text into sentences
             let sentences: Vec<&str> = self.displayed_text
                 .split(|c| c == '.' || c == '!' || c == '?' || c == '\n')
                 .filter(|s| !s.trim().is_empty())
                 .collect();
             
-            // 保留固定数量的最近句子
-            let max_sentences = 20; // 保留最后20个句子
+            // Keep a fixed number of most recent sentences
+            let max_sentences = 20; // Keep the last 20 sentences
             if sentences.len() > max_sentences {
                 let start_idx = sentences.len() - max_sentences;
-                // 重新组合句子，添加分隔符
+                // Recombine sentences, adding separators
                 let mut new_text = String::new();
                 for (i, sentence) in sentences[start_idx..].iter().enumerate() {
                     if i > 0 {
-                        // 添加适当的分隔符
+                        // Add appropriate separator
                         new_text.push_str(". ");
                     }
                     new_text.push_str(sentence.trim());
@@ -650,94 +1265,93 @@ impl Engine {
             }
         }
     }
-
+    
+    /// Displays text in the terminal
+    /// 
+    /// # Arguments
+    /// 
+    /// * `text` - The text to display
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(())` - The text was displayed successfully
+    /// * `Err(AppError)` - An error occurred while displaying the text
+    fn display_text(text: &str) -> Result<(), AppError> {
+        // Clear line and display new text
+        print!("\r");  // Return to start of line
+        // Cover old content with spaces
+        for _ in 0..120 {  // Assume terminal width is up to 120 characters
+            print!(" ");
+        }
+        print!("\r> {}", text);
+        io::stdout().flush()?;
+        Ok(())
+    }
+    
+    /// Performs a graceful shutdown
+    /// 
+    /// This method ensures all resources are properly released
+    /// and captures any final captions before exiting.
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(())` - Shutdown completed successfully
+    /// * `Err(AppError)` - An error occurred during shutdown
     async fn graceful_shutdown(&mut self) -> Result<(), AppError> {
         info!("Performing graceful shutdown");
-        // 使用带重试的方法获取最终字幕
-        match self.get_livecaptions_with_retry(3).await {
+        
+        // Try to get final captions
+        let mut source = self.caption_source.lock().await;
+        match source.get_captions().await {
             Ok(Some(text)) => {
-                // 将最后的文本追加到显示文本中
-                self.displayed_text.push_str(&text);
-                // 限制文本长度
+                // Process the final caption if possible
+                let final_text = if let Some(service) = &self.translation_service {
+                    match service.translate(&text).await {
+                        Ok(translated) => format!("{} [{}]", text, translated),
+                        Err(_) => text,
+                    }
+                } else {
+                    text
+                };
+                
+                // Append to displayed text
+                self.displayed_text.push_str(&final_text);
+                
+                // Limit text length
                 self.limit_text_length();
-                info!("Final captions captured: {}", text);
-                // 使用更兼容的方式显示最终字幕
-                println!("\n");
-                print!("> {}", self.displayed_text);
-                io::stdout().flush().ok();
-            }
+                
+                info!("Final captions captured: {}", final_text);
+            },
             Ok(None) => {
                 info!("No new captions at shutdown");
-                if !self.displayed_text.is_empty() {
-                    // 使用更兼容的方式显示最终字幕
-                    println!("\n");
-                    print!("> {}", self.displayed_text);
-                    io::stdout().flush().ok();
-                }
-            }
+            },
             Err(err) => {
                 warn!("Could not capture final captions: {}", err);
-                if !self.displayed_text.is_empty() {
-                    // 使用更兼容的方式显示最终字幕
-                    println!("\n");
-                    print!("> {}", self.displayed_text);
-                    io::stdout().flush().ok();
-                }
             }
         }
+        
+        // Display final text
+        if !self.displayed_text.is_empty() {
+            println!("\n");
+            print!("> {}", self.displayed_text);
+            io::stdout().flush()?;
+        }
+        
+        // Shut down the caption source
+        source.shutdown().await?;
         
         info!("Shutdown complete");
         Ok(())
     }
 }
 
-fn is_livecaptions_running() -> bool {
-    unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None).0 != 0 }
-}
-
-// 异步处理捕获的文本（包括翻译）
-async fn process_caption(
-    text: String, 
-    translation_service: Option<&Arc<dyn TranslationService>>
-) -> Result<String, AppError> {
-    if let Some(service) = translation_service {
-        match service.translate(&text).await {
-            Ok(translated) => {
-                info!("Translated: {} -> {}", text, translated);
-                Ok(format!("{} [{}]", text, translated))
-            }
-            Err(e) => {
-                warn!("Translation failed: {}", e);
-                Ok(text)
-            }
-        }
-    } else {
-        Ok(text)
-    }
-}
-
-// 使用crossterm清除当前行并显示文本
-fn display_text(text: &str) -> Result<(), AppError> {
-    // 使用标准输出方法，但更高效地清除行
-    print!("\r");  // 回车到行首
-    // 用足够多的空格覆盖旧内容
-    for _ in 0..120 {  // 假设终端宽度不超过120个字符
-        print!(" ");
-    }
-    print!("\r> {}", text);
-    io::stdout().flush()?;
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    
-    // 解析命令行参数
+/// Creates and configures an engine based on command line arguments and config file
+async fn create_engine() -> Result<Engine, AppError> {
+    // Parse command line arguments
     let args = Args::parse();
     info!("get-livecaptions starting");
     
-    // 配置路径
+    // Determine config path
     let config_path = args.config.unwrap_or_else(|| {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         path.push("get-livecaptions");
@@ -749,11 +1363,11 @@ async fn main() -> Result<()> {
         path
     });
     
-    // 加载或创建配置
+    // Load or create configuration
     let mut config = Config::load(&config_path)
         .context("Failed to load config")?;
     
-    // 使用命令行参数覆盖配置（如果提供）
+    // Override config with command line arguments
     if let Some(interval) = args.capture_interval {
         config.capture_interval = interval;
     }
@@ -763,173 +1377,144 @@ async fn main() -> Result<()> {
     if let Some(output) = args.output_file {
         config.output_file = Some(output);
     }
+    if let Some(enable) = args.enable_translation {
+        config.enable_translation = enable;
+    }
+    if let Some(lang) = args.target_language {
+        config.target_language = Some(lang);
+    }
+    if let Some(threads) = args.worker_threads {
+        config.worker_threads = threads;
+    }
+    if let Some(source) = args.caption_source {
+        config.caption_source = source;
+    }
     
-    // 保存更新后的配置
+    // Validate the configuration
+    config.validate()?;
+    
+    // Save updated configuration
     config.save(&config_path)?;
     
-    // 检查 Live Captions 是否运行
-    if !is_livecaptions_running() {
-        error!("Live Captions is not running. Program exiting.");
-        process::exit(1);
+    // Create and initialize the engine
+    Engine::new(config).await
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logger
+    env_logger::init();
+    
+    // Create engine
+    let mut engine = create_engine().await?;
+    
+    // Run the engine
+    engine.run().await?;
+    
+    Ok(())
+}
+
+/// Tests module
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    /// Tests for text difference detection
+    #[tokio::test]
+    async fn test_extract_new_text() {
+        // Create a caption source instance
+        let mut captions = WindowsLiveCaptions::new().unwrap();
+        
+        // Simple append test
+        captions.previous_text = "Hello world".to_string();
+        let result = captions.extract_new_text("Hello world, how are you?");
+        assert_eq!(result, ", how are you?");
+        
+        // Empty previous text test
+        captions.previous_text = "".to_string();
+        let result = captions.extract_new_text("New text");
+        assert_eq!(result, "New text");
+        
+        // No changes test
+        captions.previous_text = "Unchanged text".to_string();
+        let result = captions.extract_new_text("Unchanged text");
+        assert_eq!(result, "");
+        
+        // Complex change test
+        captions.previous_text = "This is a test with some text".to_string();
+        let result = captions.extract_new_text("This is a new test with additional text");
+        assert_eq!(result, "new additional");
     }
     
-    // 创建输出文件（如果配置了）
-    let mut output_file = if let Some(path) = &config.output_file {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("Failed to open output file: {}", path))?;
-        info!("Writing output to file: {}", path);
-        Some(file)
-    } else {
-        None
-    };
-    
-    // 初始化引擎
-    let mut engine = Engine::new()
-        .context("Failed to initialize engine")?;
-    
-    // 从配置设置引擎参数
-    engine.min_interval = config.min_interval;
-    engine.max_interval = config.max_interval;
-    engine.adaptive_interval = config.min_interval;
-    engine.max_text_length = config.max_text_length;
-    
-    // 初始化定时器
-    let mut windows_timer = tokio::time::interval(Duration::from_secs(config.check_interval));
-    let mut capture_timer = tokio::time::interval(Duration::from_secs_f64(config.capture_interval));
-    
-    // 设置 Ctrl+C 处理
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    
-    println!("Live captions monitoring started:");
-    println!("  - Capture interval: {} seconds", config.capture_interval);
-    println!("  - Check interval: {} seconds", config.check_interval);
-    if config.enable_translation {
-        println!("  - Translation enabled (target: {})", 
-                 config.target_language.as_deref().unwrap_or("auto"));
-    }
-    if output_file.is_some() {
-        println!("  - Writing to file: {}", config.output_file.as_deref().unwrap());
-    }
-    println!("Press Ctrl+C to exit");
-    println!("-----------------------------------");
-    
-    // 创建翻译服务（如果启用）
-    let translation_service = if config.enable_translation {
-        if let Some(api_key) = &config.translation_api_key {
-            // 确定API类型
-            let api_type = match config.translation_api_type.as_deref() {
-                Some("deepl") => TranslationApiType::DeepL,
-                Some("generic") => TranslationApiType::Generic,
-                Some("demo") => TranslationApiType::Demo,
-                Some("openai") => TranslationApiType::OpenAI,
-                _ => TranslationApiType::DeepL, // 默认使用DeepL
-            };
-            
-            // 确定目标语言
-            let target_lang = config.target_language.clone().unwrap_or_else(|| {
-                match api_type {
-                    TranslationApiType::DeepL => "ZH".to_string(), // DeepL 使用大写语言代码
-                    TranslationApiType::OpenAI => "Chinese".to_string(), // OpenAI 使用自然语言描述
-                    _ => "zh-CN".to_string(),
-                }
-            });
-            
-            info!("Initializing translation service with {:?} API", api_type);
-            Some(create_translation_service(
-                api_key.clone(),
-                target_lang,
-                api_type,
-                config.openai_api_url.clone(),
-                config.openai_model.clone(),
-                config.openai_system_prompt.clone()
-            ))
-        } else {
-            warn!("Translation enabled but no API key provided");
-            None
-        }
-    } else {
-        None
-    };
-    
-    loop {
-        tokio::select! {
-            _ = windows_timer.tick() => {
-                info!("Checking if Live Captions is running");
-                if !is_livecaptions_running() {
-                    error!("Live Captions is no longer running. Program exiting.");
-                    if let Err(e) = engine.graceful_shutdown().await {
-                        error!("Error during shutdown: {}", e);
-                    }
-                    process::exit(1);
-                }
-            },
-            _ = capture_timer.tick() => {
-                info!("Capturing live captions");
-                // 使用带重试的方法获取字幕
-                match engine.get_livecaptions_with_retry(2).await {
-                    Ok(Some(text)) => {
-                        // 使用异步方法处理捕获的文本（包括翻译）
-                        let text_clone = text.clone();
-                        let processed_text = process_caption(text_clone, translation_service.as_ref()).await
-                            .unwrap_or_else(|e| {
-                                warn!("Error processing caption: {}", e);
-                                text.clone()
-                            });
-                        
-                        // 将新文本追加到已显示的文本中
-                        engine.displayed_text.push_str(&processed_text);
-                        
-                        // 限制文本长度
-                        engine.limit_text_length();
-                        
-                        // 显示文本
-                        if let Err(e) = display_text(&engine.displayed_text) {
-                            warn!("Error displaying text: {}", e);
-                        }
-                        
-                        // 如果配置了输出文件，写入文件
-                        if let Some(file) = &mut output_file {
-                            if let Err(e) = writeln!(file, "{}", processed_text) {
-                                warn!("Failed to write to output file: {}", e);
-                            }
-                        }
-                        
-                        // 有新内容时重置连续空捕获计数并降低间隔
-                        engine.consecutive_empty_captures = 0;
-                        engine.adaptive_interval = engine.min_interval;
-                        // 更新定时器
-                        capture_timer = tokio::time::interval(Duration::from_secs_f64(engine.adaptive_interval));
-                    },
-                    Ok(None) => {
-                        info!("No new captions available");
-                        // 连续没有新内容时逐渐增加间隔以减少资源使用
-                        engine.consecutive_empty_captures += 1;
-                        if engine.consecutive_empty_captures > 5 {
-                            engine.adaptive_interval = (engine.adaptive_interval * 1.2).min(engine.max_interval);
-                            info!("Adjusting capture interval to {} seconds", engine.adaptive_interval);
-                            // 更新定时器
-                            capture_timer = tokio::time::interval(Duration::from_secs_f64(engine.adaptive_interval));
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to capture captions after retries: {}", e);
-                    }
-                }
-            },
-            _ = &mut ctrl_c => {
-                println!("\nReceived shutdown signal");
-                if let Err(e) = engine.graceful_shutdown().await {
-                    error!("Error during shutdown: {}", e);
-                    process::exit(1);
-                }
-                info!("Program terminated successfully");
-                return Ok(());
-            }
+    /// Tests for configuration validation
+    #[test]
+    fn test_config_validation() {
+        // Test valid configuration
+        let config = Config {
+            capture_interval: 1.0,
+            check_interval: 10,
+            min_interval: 0.5,
+            max_interval: 3.0,
+            max_text_length: 10000,
+            output_file: None,
+            enable_translation: false,
+            translation_api_key: None,
+            translation_api_type: TranslationApiType::DeepL,
+            target_language: None,
+            openai_api_url: None,
+            openai_model: None,
+            openai_system_prompt: None,
+            worker_threads: 2,
+            caption_source: "windows_live_captions".to_string(),
+            custom_window_class: None,
+            custom_window_name: None,
+            custom_element_id: None,
         };
+        assert!(config.validate().is_ok());
+        
+        // Test invalid intervals
+        let mut invalid_config = config.clone();
+        invalid_config.min_interval = 5.0;
+        invalid_config.max_interval = 3.0;
+        assert!(invalid_config.validate().is_err());
+        
+        // Test invalid worker threads
+        let mut invalid_config = config.clone();
+        invalid_config.worker_threads = 0;
+        assert!(invalid_config.validate().is_err());
+        
+        // Test missing translation API key
+        let mut invalid_config = config.clone();
+        invalid_config.enable_translation = true;
+        invalid_config.translation_api_type = TranslationApiType::DeepL;
+        invalid_config.translation_api_key = None;
+        assert!(invalid_config.validate().is_err());
+        
+        // Test missing target language
+        let mut invalid_config = config.clone();
+        invalid_config.enable_translation = true;
+        invalid_config.translation_api_type = TranslationApiType::Demo;
+        invalid_config.target_language = None;
+        assert!(invalid_config.validate().is_err());
+        
+        // Test custom caption source validation
+        let mut invalid_config = config.clone();
+        invalid_config.caption_source = "custom".to_string();
+        invalid_config.custom_window_class = None;
+        invalid_config.custom_window_name = None;
+        assert!(invalid_config.validate().is_err());
+    }
+    
+    /// Tests for demo translation service
+    #[tokio::test]
+    async fn test_demo_translation() {
+        let service = DemoTranslation {
+            target_language: "Spanish".to_string(),
+        };
+        
+        let result = service.translate("Hello world").await.unwrap();
+        assert_eq!(result, "[Spanish Translation]: Hello world");
+        assert_eq!(service.get_name(), "Demo");
+        assert_eq!(service.get_target_language(), "Spanish");
     }
 }
