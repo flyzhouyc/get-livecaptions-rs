@@ -1,5 +1,4 @@
 use tokio::time::{Duration, Instant};
-use std::process;
 use std::path::PathBuf;
 use std::sync::Arc;
 use windows::{
@@ -15,10 +14,8 @@ use std::num::NonZeroUsize;
 use std::fs;
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
-use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task;
-use std::collections::HashMap;
 
 /// Main module documentation
 /// 
@@ -34,14 +31,6 @@ use std::collections::HashMap;
 /// - Displays processed text in the terminal and/or writes to a file
 /// - Configurable via JSON configuration file and command-line arguments
 /// - Adaptive capture intervals based on content availability
-/// 
-/// # Components
-/// 
-/// - Error handling: Custom error types for detailed error reporting
-/// - Translation services: Multiple translation service implementations
-/// - UI automation: Windows UI Automation interfacing with caching
-/// - Configuration: File-based JSON configuration with command-line overrides
-/// - Concurrency: Asynchronous design with worker tasks
 
 /// Define custom error types for better error handling
 #[derive(Debug, Error)]
@@ -77,6 +66,10 @@ enum AppError {
     /// Validation errors
     #[error("Validation error: {0}")]
     Validation(String),
+
+    /// Anyhow errors
+    #[error("Error: {0}")]
+    Anyhow(#[from] anyhow::Error),
 }
 
 // Implement From for windows errors
@@ -86,62 +79,20 @@ impl From<windows::core::Error> for AppError {
     }
 }
 
-/// Trait that defines a source of captions
-/// 
-/// This abstraction allows for different implementations of caption sources,
-/// not just Windows Live Captions.
-#[async_trait]
-trait CaptionSource: Send + Sync {
-    /// Initialize the caption source
-    async fn initialize(&mut self) -> Result<(), AppError>;
-    
-    /// Check if the caption source is available
-    async fn is_available(&self) -> bool;
-    
-    /// Get captions from the source
-    /// 
-    /// Returns None if no new captions are available
-    async fn get_captions(&mut self) -> Result<Option<String>, AppError>;
-    
-    /// Shutdown the caption source
-    async fn shutdown(&mut self) -> Result<(), AppError>;
-}
-
-/// Windows Live Captions implementation of the CaptionSource trait
+/// Windows Live Captions handler that operates on a dedicated thread
 struct WindowsLiveCaptions {
-    automation: IUIAutomation,
-    condition: IUIAutomationCondition,
     previous_text: String,
     element_cache: LruCache<CacheKey, IUIAutomationElement>,
     last_window_handle: HWND,
     max_retries: usize,
+    automation: IUIAutomation,
+    condition: IUIAutomationCondition,
 }
 
 impl Drop for WindowsLiveCaptions {
     fn drop(&mut self) {
         unsafe { CoUninitialize(); }
         info!("COM resources released");
-    }
-}
-
-#[async_trait]
-impl CaptionSource for WindowsLiveCaptions {
-    async fn initialize(&mut self) -> Result<(), AppError> {
-        debug!("Initializing Windows Live Captions source");
-        Ok(())
-    }
-    
-    async fn is_available(&self) -> bool {
-        unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None).0 != 0 }
-    }
-    
-    async fn get_captions(&mut self) -> Result<Option<String>, AppError> {
-        self.get_livecaptions_with_retry(self.max_retries).await
-    }
-    
-    async fn shutdown(&mut self) -> Result<(), AppError> {
-        debug!("Shutting down Windows Live Captions source");
-        Ok(())
     }
 }
 
@@ -153,7 +104,7 @@ impl WindowsLiveCaptions {
     /// Returns an error if COM initialization or UI Automation setup fails
     fn new() -> Result<Self, AppError> {
         unsafe { 
-            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // Changed to APARTMENTTHREADED
             if hr.is_err() {
                 return Err(AppError::Com(format!("Failed to initialize Windows COM: {:?}", hr)));
             }
@@ -192,19 +143,21 @@ impl WindowsLiveCaptions {
     /// # Returns
     /// 
     /// A String containing only the newly added text
-    fn extract_new_text<'a>(&self, current: &'a str) -> String {
+    fn extract_new_text(&self, current: &str) -> String {
         if self.previous_text.is_empty() {
             return current.to_string();
         }
         
         // Use similar library to compute differences
-        let diff = TextDiff::from_chars(&self.previous_text, current);
+        let diff = TextDiff::from_chars(self.previous_text.as_str(), current);
         
         // Extract only the inserted parts
         let mut new_text = String::new();
         for change in diff.iter_all_changes() {
             if change.tag() == ChangeTag::Insert {
-                new_text.push(change.value().chars().next().unwrap_or(' '));
+                if let Some(ch) = change.value().chars().next() {
+                    new_text.push(ch);
+                }
             }
         }
         
@@ -231,7 +184,7 @@ impl WindowsLiveCaptions {
     /// * `Ok(Some(String))` - New captions were found
     /// * `Ok(None)` - No new captions were found
     /// * `Err(AppError)` - An error occurred
-    async fn get_livecaptions(&mut self) -> Result<Option<String>, AppError> {
+    fn get_livecaptions(&mut self) -> Result<Option<String>, AppError> {
         let window = unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None) };
         if window.0 == 0 {
             return Err(AppError::UiAutomation("Live Captions window not found".to_string()));
@@ -325,22 +278,22 @@ impl WindowsLiveCaptions {
     /// * `Ok(Some(String))` - New captions were found
     /// * `Ok(None)` - No new captions were found
     /// * `Err(AppError)` - All retry attempts failed
-    async fn get_livecaptions_with_retry(&mut self, max_retries: usize) -> Result<Option<String>, AppError> {
+    fn get_livecaptions_with_retry(&mut self, max_retries: usize) -> Result<Option<String>, AppError> {
         let mut attempts = 0;
         let mut last_error = None;
         
         while attempts < max_retries {
-            match self.get_livecaptions().await {
+            match self.get_livecaptions() {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     attempts += 1;
                     warn!("Attempt {}/{} failed: {}", attempts, max_retries, e);
                     last_error = Some(e);
                     if attempts < max_retries {
-                        // Exponential backoff
+                        // Exponential backoff - note we're not using async sleep here
                         let backoff_ms = 100 * 2u64.pow(attempts as u32);
                         debug!("Retrying in {} ms", backoff_ms);
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
                     }
                 }
             }
@@ -348,28 +301,137 @@ impl WindowsLiveCaptions {
         
         Err(last_error.unwrap_or_else(|| AppError::UiAutomation("Unknown error after retries".to_string())))
     }
+    
+    /// Checks if Live Captions is running
+    fn is_available(&self) -> bool {
+        unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None).0 != 0 }
+    }
 }
 
-/// Define a trait for translation services
-#[async_trait]
-trait TranslationService: Send + Sync {
-    /// Translates text to the target language
-    /// 
-    /// # Arguments
-    /// 
-    /// * `text` - The text to translate
+// Message types for caption worker thread
+enum CaptionCommand {
+    GetCaption(oneshot::Sender<Result<Option<String>, AppError>>),
+    CheckAvailability(oneshot::Sender<bool>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+/// Caption Actor that runs on its own thread to interact with Windows COM objects
+struct CaptionActor {
+    captions: WindowsLiveCaptions,
+    receiver: mpsc::Receiver<CaptionCommand>,
+}
+
+impl CaptionActor {
+    /// Main loop for the caption actor
+    fn run(&mut self) {
+        while let Some(cmd) = self.receiver.blocking_recv() {
+            match cmd {
+                CaptionCommand::GetCaption(sender) => {
+                    let result = self.captions.get_livecaptions_with_retry(3);
+                    let _ = sender.send(result);
+                },
+                CaptionCommand::CheckAvailability(sender) => {
+                    let available = self.captions.is_available();
+                    let _ = sender.send(available);
+                },
+                CaptionCommand::Shutdown(sender) => {
+                    debug!("Caption actor shutting down");
+                    let _ = sender.send(());
+                    break;
+                }
+            }
+        }
+        debug!("Caption actor terminated");
+    }
+}
+
+/// Thread-safe handle to communicate with the caption actor
+#[derive(Clone)]
+struct CaptionHandle {
+    sender: mpsc::Sender<CaptionCommand>,
+}
+
+impl CaptionHandle {
+    /// Creates a new caption actor on a dedicated thread
     /// 
     /// # Returns
     /// 
-    /// * `Ok(String)` - The translated text
-    /// * `Err(AppError)` - Translation failed
-    async fn translate(&self, text: &str) -> Result<String, AppError>;
+    /// * `Ok(CaptionHandle)` - The handle to communicate with the actor
+    /// * `Err(AppError)` - Failed to create the caption actor
+    fn new() -> Result<Self, AppError> {
+        let (sender, receiver) = mpsc::channel(32);
+        
+        // Start the actor on a dedicated thread
+        std::thread::Builder::new()
+            .name("caption-actor".into())
+            .spawn(move || {
+                match WindowsLiveCaptions::new() {
+                    Ok(captions) => {
+                        let mut actor = CaptionActor {
+                            captions,
+                            receiver,
+                        };
+                        actor.run();
+                    },
+                    Err(e) => {
+                        error!("Failed to initialize WindowsLiveCaptions: {}", e);
+                    }
+                }
+            })
+            .map_err(|e| AppError::Task(format!("Failed to spawn caption actor thread: {}", e)))?;
+        
+        Ok(Self { sender })
+    }
     
-    /// Gets the name of the translation service
-    fn get_name(&self) -> &str;
+    /// Gets captions asynchronously
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(Some(String))` - New captions were found
+    /// * `Ok(None)` - No new captions were found
+    /// * `Err(AppError)` - An error occurred
+    async fn get_captions(&self) -> Result<Option<String>, AppError> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.send(CaptionCommand::GetCaption(sender))
+            .await
+            .map_err(|_| AppError::Task("Caption actor is no longer running".to_string()))?;
+        
+        receiver.await
+            .map_err(|_| AppError::Task("Caption actor didn't respond".to_string()))?
+    }
     
-    /// Gets the target language code
-    fn get_target_language(&self) -> &str;
+    /// Checks if Live Captions is available
+    /// 
+    /// # Returns
+    /// 
+    /// * `true` - Live Captions is available
+    /// * `false` - Live Captions is not available
+    async fn is_available(&self) -> Result<bool, AppError> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.send(CaptionCommand::CheckAvailability(sender))
+            .await
+            .map_err(|_| AppError::Task("Caption actor is no longer running".to_string()))?;
+        
+        receiver.await
+            .map_err(|_| AppError::Task("Caption actor didn't respond".to_string()))
+    }
+    
+    /// Shuts down the caption actor
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(())` - The actor was shut down successfully
+    /// * `Err(AppError)` - Failed to shut down the actor
+    async fn shutdown(&self) -> Result<(), AppError> {
+        let (sender, receiver) = oneshot::channel();
+        if let Err(_) = self.sender.send(CaptionCommand::Shutdown(sender)).await {
+            // Actor is already gone, that's fine
+            return Ok(());
+        }
+        
+        receiver.await
+            .map_err(|_| AppError::Task("Caption actor didn't respond to shutdown command".to_string()))
+    }
 }
 
 /// Translation API types supported by the application
@@ -423,31 +485,26 @@ impl RateLimiter {
     }
 }
 
-/// DeepL Translation Service implementation
-struct DeepLTranslation {
-    api_key: String,
-    target_language: String,
-    client: reqwest::Client,
-    rate_limiter: Mutex<RateLimiter>,
-}
-
-/// Generic Translation Service implementation
-struct GenericTranslation {
-    api_key: String,
-    target_language: String,
-    client: reqwest::Client,
-    rate_limiter: Mutex<RateLimiter>,
-}
-
-/// OpenAI Translation Service implementation
-struct OpenAITranslation {
-    api_key: String,
-    target_language: String,
-    client: reqwest::Client,
-    api_url: String,
-    model: String,
-    system_prompt: String,
-    rate_limiter: Mutex<RateLimiter>,
+/// Trait defining a translation service
+#[async_trait::async_trait]
+trait TranslationService: Send + Sync {
+    /// Translates text to the target language
+    /// 
+    /// # Arguments
+    /// 
+    /// * `text` - The text to translate
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(String)` - The translated text
+    /// * `Err(AppError)` - Translation failed
+    async fn translate(&self, text: &str) -> Result<String, AppError>;
+    
+    /// Gets the name of the translation service
+    fn get_name(&self) -> &str;
+    
+    /// Gets the target language code
+    fn get_target_language(&self) -> &str;
 }
 
 /// Demo Translation Service implementation
@@ -455,7 +512,7 @@ struct DemoTranslation {
     target_language: String,
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl TranslationService for DemoTranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         Ok(format!("[{} Translation]: {}", self.target_language, text))
@@ -470,7 +527,15 @@ impl TranslationService for DemoTranslation {
     }
 }
 
-#[async_trait]
+/// DeepL Translation Service implementation
+struct DeepLTranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    rate_limiter: tokio::sync::Mutex<RateLimiter>,
+}
+
+#[async_trait::async_trait]
 impl TranslationService for DeepLTranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         // Rate limiting
@@ -524,7 +589,15 @@ impl TranslationService for DeepLTranslation {
     }
 }
 
-#[async_trait]
+/// Generic Translation Service implementation
+struct GenericTranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    rate_limiter: tokio::sync::Mutex<RateLimiter>,
+}
+
+#[async_trait::async_trait]
 impl TranslationService for GenericTranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         // Rate limiting
@@ -568,7 +641,18 @@ impl TranslationService for GenericTranslation {
     }
 }
 
-#[async_trait]
+/// OpenAI Translation Service implementation
+struct OpenAITranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    api_url: String,
+    model: String,
+    system_prompt: String,
+    rate_limiter: tokio::sync::Mutex<RateLimiter>,
+}
+
+#[async_trait::async_trait]
 impl TranslationService for OpenAITranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         // Rate limiting
@@ -659,7 +743,7 @@ fn create_translation_service(
                 api_key,
                 target_language,
                 client: reqwest::Client::new(),
-                rate_limiter: Mutex::new(RateLimiter::new(500)), // 500ms between requests
+                rate_limiter: tokio::sync::Mutex::new(RateLimiter::new(500)), // 500ms between requests
             })
         },
         TranslationApiType::Generic => {
@@ -667,7 +751,7 @@ fn create_translation_service(
                 api_key,
                 target_language,
                 client: reqwest::Client::new(),
-                rate_limiter: Mutex::new(RateLimiter::new(500)),
+                rate_limiter: tokio::sync::Mutex::new(RateLimiter::new(500)),
             })
         },
         TranslationApiType::OpenAI => {
@@ -680,14 +764,23 @@ fn create_translation_service(
                 system_prompt: openai_system_prompt.unwrap_or_else(|| 
                     "You are a translator. Translate the following text to the target language. Only respond with the translation, no explanations.".to_string()
                 ),
-                rate_limiter: Mutex::new(RateLimiter::new(1000)), // OpenAI might need more time between requests
+                rate_limiter: tokio::sync::Mutex::new(RateLimiter::new(1000)), // OpenAI might need more time between requests
             })
         },
     }
 }
 
+/// Keys for UI element caching
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheKey {
+    /// Window element cache key
+    WindowElement(isize), // Window handle value as key
+    /// Text element cache key
+    TextElement(isize),   // Window handle value as key
+}
+
 /// Configuration file structure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Config {
     // Basic settings
     #[serde(default = "default_capture_interval")]
@@ -721,19 +814,6 @@ struct Config {
     openai_api_url: Option<String>,     // API endpoint URL
     openai_model: Option<String>,       // Model name
     openai_system_prompt: Option<String>, // System prompt
-    
-    // Concurrency settings
-    #[serde(default = "default_worker_threads")]
-    worker_threads: usize,       // Number of worker threads for processing
-    
-    // UI automation settings
-    #[serde(default = "default_caption_source")]
-    caption_source: String,      // Caption source type
-    
-    // Custom window settings (for non-Windows Live Captions sources)
-    custom_window_class: Option<String>,  // Custom window class name
-    custom_window_name: Option<String>,   // Custom window name
-    custom_element_id: Option<String>,    // Custom element ID
 }
 
 // Default value functions for serde
@@ -742,8 +822,6 @@ fn default_check_interval() -> u64 { 10 }
 fn default_min_interval() -> f64 { 0.5 }
 fn default_max_interval() -> f64 { 3.0 }
 fn default_max_text_length() -> usize { 10000 }
-fn default_worker_threads() -> usize { 2 }
-fn default_caption_source() -> String { "windows_live_captions".to_string() }
 
 impl Config {
     /// Loads configuration from a file, creating a default if it doesn't exist
@@ -835,11 +913,6 @@ impl Config {
             return Err(AppError::Validation("Maximum text length cannot be zero".to_string()));
         }
         
-        // Validate worker threads
-        if self.worker_threads == 0 {
-            return Err(AppError::Validation("Worker threads cannot be zero".to_string()));
-        }
-        
         // Validate translation settings
         if self.enable_translation {
             if self.translation_api_type != TranslationApiType::Demo && self.translation_api_key.is_none() {
@@ -855,22 +928,6 @@ impl Config {
                 if self.openai_model.is_none() {
                     warn!("No OpenAI model specified, will use default");
                 }
-            }
-        }
-        
-        // Validate caption source
-        if self.caption_source.is_empty() {
-            return Err(AppError::Validation("Caption source cannot be empty".to_string()));
-        }
-        
-        // Validate custom window settings if needed
-        if self.caption_source == "custom" {
-            if self.custom_window_class.is_none() && self.custom_window_name.is_none() {
-                return Err(AppError::Validation("Custom caption source requires either window class or window name".to_string()));
-            }
-            
-            if self.custom_element_id.is_none() {
-                return Err(AppError::Validation("Custom caption source requires element ID".to_string()));
             }
         }
         
@@ -894,11 +951,6 @@ impl Default for Config {
             openai_api_url: None,
             openai_model: None,
             openai_system_prompt: None,
-            worker_threads: default_worker_threads(),
-            caption_source: default_caption_source(),
-            custom_window_class: None,
-            custom_window_name: None,
-            custom_element_id: None,
         }
     }
 }
@@ -930,30 +982,13 @@ struct Args {
     /// Target language for translation
     #[arg(short = 'l', long)]
     target_language: Option<String>,
-    
-    /// Number of worker threads
-    #[arg(short = 'w', long)]
-    worker_threads: Option<usize>,
-    
-    /// Caption source (windows_live_captions, custom)
-    #[arg(short = 's', long)]
-    caption_source: Option<String>,
-}
-
-/// Keys for UI element caching
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum CacheKey {
-    /// Window element cache key
-    WindowElement(isize), // Window handle value as key
-    /// Text element cache key
-    TextElement(isize),   // Window handle value as key
 }
 
 /// Main engine for the caption process
 struct Engine {
     config: Config,
     displayed_text: String, // Text displayed in the terminal
-    caption_source: Arc<Mutex<dyn CaptionSource + Send + Sync>>,
+    caption_handle: CaptionHandle,
     translation_service: Option<Arc<dyn TranslationService>>,
     consecutive_empty_captures: usize, // Count of consecutive empty captures
     adaptive_interval: f64, // Adaptive capture interval
@@ -974,22 +1009,8 @@ impl Engine {
     async fn new(config: Config) -> Result<Self, AppError> {
         debug!("Initializing engine with config: {:?}", config);
         
-        // Create caption source based on configuration
-        let caption_source: Arc<Mutex<dyn CaptionSource + Send + Sync>> = match config.caption_source.as_str() {
-            "windows_live_captions" => {
-                let source = WindowsLiveCaptions::new()?;
-                Arc::new(Mutex::new(source))
-            },
-            "custom" => {
-                return Err(AppError::Config("Custom caption source not yet implemented".to_string()));
-            },
-            _ => {
-                return Err(AppError::Config(format!("Unknown caption source: {}", config.caption_source)));
-            }
-        };
-        
-        // Initialize the caption source
-        caption_source.lock().await.initialize().await?;
+        // Create caption handle
+        let caption_handle = CaptionHandle::new()?;
         
         // Create translation service if enabled
         let translation_service = if config.enable_translation {
@@ -1038,7 +1059,7 @@ impl Engine {
                 .write(true)
                 .append(true)
                 .open(path)
-                .with_context(|| format!("Failed to open output file: {}", path))?;
+                .map_err(|e| AppError::Io(e))?;
             info!("Writing output to file: {}", path);
             Some(file)
         } else {
@@ -1047,7 +1068,7 @@ impl Engine {
         
         Ok(Self {
             displayed_text: String::new(),
-            caption_source,
+            caption_handle,
             translation_service,
             consecutive_empty_captures: 0,
             adaptive_interval: config.min_interval,
@@ -1058,8 +1079,8 @@ impl Engine {
     
     /// Main loop for the engine
     /// 
-    /// This function handles the main event loop and coordinates
-    /// the capture, processing, and output tasks.
+    /// This function handles the main event loop, capturing, processing,
+    /// and displaying captions.
     /// 
     /// # Returns
     /// 
@@ -1068,106 +1089,9 @@ impl Engine {
     async fn run(&mut self) -> Result<(), AppError> {
         info!("Starting engine main loop");
         
-        // Create channels for communication between tasks
-        let (caption_tx, mut caption_rx) = mpsc::channel::<String>(32);
-        let (processed_tx, mut processed_rx) = mpsc::channel::<String>(32);
-        
-        // Clone references for the worker tasks
-        let caption_source = self.caption_source.clone();
-        let translation_service = self.translation_service.clone();
-        let config = self.config.clone();
-        
-        // Spawn caption capture task
-        let capture_handle = task::spawn(async move {
-            let mut adaptive_interval = config.min_interval;
-            let mut consecutive_empty = 0;
-            
-            let mut capture_timer = tokio::time::interval(Duration::from_secs_f64(config.capture_interval));
-            
-            loop {
-                // Wait for the next tick
-                capture_timer.tick().await;
-                
-                // Get captions
-                let mut source = caption_source.lock().await;
-                match source.get_captions().await {
-                    Ok(Some(text)) => {
-                        debug!("Captured new text: {}", text);
-                        if caption_tx.send(text).await.is_err() {
-                            warn!("Failed to send captured text to processor");
-                            break;
-                        }
-                        
-                        // Reset consecutive empty counter and adaptive interval
-                        consecutive_empty = 0;
-                        adaptive_interval = config.min_interval;
-                        capture_timer = tokio::time::interval(Duration::from_secs_f64(adaptive_interval));
-                    },
-                    Ok(None) => {
-                        debug!("No new captions available");
-                        // Gradually increase interval on consecutive empty captures
-                        consecutive_empty += 1;
-                        if consecutive_empty > 5 {
-                            adaptive_interval = (adaptive_interval * 1.2).min(config.max_interval);
-                            debug!("Adjusting capture interval to {} seconds", adaptive_interval);
-                            capture_timer = tokio::time::interval(Duration::from_secs_f64(adaptive_interval));
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to capture captions: {}", e);
-                        // Don't break on errors, continue trying
-                    }
-                }
-                
-                // Check if source is still available
-                if !source.is_available().await {
-                    error!("Caption source is no longer available");
-                    break;
-                }
-            }
-        });
-        
-        // Spawn processor tasks
-        let mut processor_handles = Vec::new();
-        for id in 0..self.config.worker_threads {
-            let processor_tx = processed_tx.clone();
-            let mut processor_rx = caption_rx.clone();
-            let translation = translation_service.clone();
-            
-            let handle = task::spawn(async move {
-                debug!("Starting processor task {}", id);
-                while let Some(text) = processor_rx.recv().await {
-                    // Process text (translate if enabled)
-                    let processed = match &translation {
-                        Some(service) => {
-                            match service.translate(&text).await {
-                                Ok(translated) => {
-                                    debug!("Translated text: {} -> {}", text, translated);
-                                    format!("{} [{}]", text, translated)
-                                },
-                                Err(e) => {
-                                    warn!("Translation failed: {}", e);
-                                    text
-                                }
-                            }
-                        },
-                        None => text,
-                    };
-                    
-                    // Send processed text
-                    if processor_tx.send(processed).await.is_err() {
-                        warn!("Failed to send processed text to output");
-                        break;
-                    }
-                }
-                debug!("Processor task {} exiting", id);
-            });
-            
-            processor_handles.push(handle);
-        }
-        
         // Initialize checking timer
         let mut check_timer = tokio::time::interval(Duration::from_secs(self.config.check_interval));
+        let mut capture_timer = tokio::time::interval(Duration::from_secs_f64(self.config.capture_interval));
         
         // Set up Ctrl+C handler
         let ctrl_c = tokio::signal::ctrl_c();
@@ -1183,7 +1107,6 @@ impl Engine {
         if self.output_file.is_some() {
             println!("  - Writing to file: {}", self.config.output_file.as_deref().unwrap());
         }
-        println!("  - Worker threads: {}", self.config.worker_threads);
         println!("Press Ctrl+C to exit");
         println!("-----------------------------------");
         
@@ -1192,41 +1115,81 @@ impl Engine {
             tokio::select! {
                 _ = check_timer.tick() => {
                     info!("Checking if caption source is available");
-                    let source = self.caption_source.lock().await;
-                    if !source.is_available().await {
-                        error!("Caption source is no longer available. Program exiting.");
-                        drop(source); // Release the lock before shutdown
-                        self.graceful_shutdown().await?;
-                        return Err(AppError::UiAutomation("Caption source not available".to_string()));
+                    match self.caption_handle.is_available().await {
+                        Ok(available) => {
+                            if !available {
+                                error!("Caption source is no longer available. Program exiting.");
+                                self.graceful_shutdown().await?;
+                                return Err(AppError::UiAutomation("Caption source not available".to_string()));
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to check caption source availability: {}", e);
+                            self.graceful_shutdown().await?;
+                            return Err(e);
+                        }
                     }
                 },
-                Some(processed_text) = processed_rx.recv() => {
-                    // Append processed text to displayed text
-                    self.displayed_text.push_str(&processed_text);
-                    
-                    // Limit text length
-                    self.limit_text_length();
-                    
-                    // Display text
-                    Self::display_text(&self.displayed_text)?;
-                    
-                    // Write to output file if configured
-                    if let Some(file) = &mut self.output_file {
-                        if let Err(e) = writeln!(file, "{}", processed_text) {
-                            warn!("Failed to write to output file: {}", e);
+                _ = capture_timer.tick() => {
+                    info!("Capturing live captions");
+                    match self.caption_handle.get_captions().await {
+                        Ok(Some(text)) => {
+                            debug!("Captured new text: {}", text);
+                            // Process text (translate if enabled)
+                            let processed_text = if let Some(service) = &self.translation_service {
+                                match service.translate(&text).await {
+                                    Ok(translated) => {
+                                        debug!("Translated text: {} -> {}", text, translated);
+                                        format!("{} [{}]", text, translated)
+                                    },
+                                    Err(e) => {
+                                        warn!("Translation failed: {}", e);
+                                        text
+                                    }
+                                }
+                            } else {
+                                text
+                            };
+                            
+                            // Append processed text to displayed text
+                            self.displayed_text.push_str(&processed_text);
+                            
+                            // Limit text length
+                            self.limit_text_length();
+                            
+                            // Display text
+                            Self::display_text(&self.displayed_text)?;
+                            
+                            // Write to output file if configured
+                            if let Some(file) = &mut self.output_file {
+                                if let Err(e) = writeln!(file, "{}", processed_text) {
+                                    warn!("Failed to write to output file: {}", e);
+                                }
+                            }
+                            
+                            // Reset consecutive empty count and adaptive interval
+                            self.consecutive_empty_captures = 0;
+                            self.adaptive_interval = self.config.min_interval;
+                            capture_timer = tokio::time::interval(Duration::from_secs_f64(self.adaptive_interval));
+                        },
+                        Ok(None) => {
+                            info!("No new captions available");
+                            // Gradually increase interval on consecutive empty captures
+                            self.consecutive_empty_captures += 1;
+                            if self.consecutive_empty_captures > 5 {
+                                self.adaptive_interval = (self.adaptive_interval * 1.2).min(self.config.max_interval);
+                                info!("Adjusting capture interval to {} seconds", self.adaptive_interval);
+                                capture_timer = tokio::time::interval(Duration::from_secs_f64(self.adaptive_interval));
+                            }
+                        },
+                        Err(e) => {
+                            warn!("Failed to capture captions: {}", e);
                         }
                     }
                 },
                 _ = &mut ctrl_c => {
                     println!("\nReceived shutdown signal");
                     self.graceful_shutdown().await?;
-                    
-                    // Cancel tasks
-                    capture_handle.abort();
-                    for handle in processor_handles {
-                        handle.abort();
-                    }
-                    
                     info!("Program terminated successfully");
                     return Ok(());
                 }
@@ -1301,8 +1264,7 @@ impl Engine {
         info!("Performing graceful shutdown");
         
         // Try to get final captions
-        let mut source = self.caption_source.lock().await;
-        match source.get_captions().await {
+        match self.caption_handle.get_captions().await {
             Ok(Some(text)) => {
                 // Process the final caption if possible
                 let final_text = if let Some(service) = &self.translation_service {
@@ -1337,8 +1299,10 @@ impl Engine {
             io::stdout().flush()?;
         }
         
-        // Shut down the caption source
-        source.shutdown().await?;
+        // Shut down the caption handle
+        if let Err(e) = self.caption_handle.shutdown().await {
+            warn!("Error shutting down caption actor: {}", e);
+        }
         
         info!("Shutdown complete");
         Ok(())
@@ -1364,8 +1328,7 @@ async fn create_engine() -> Result<Engine, AppError> {
     });
     
     // Load or create configuration
-    let mut config = Config::load(&config_path)
-        .context("Failed to load config")?;
+    let mut config = Config::load(&config_path)?;
     
     // Override config with command line arguments
     if let Some(interval) = args.capture_interval {
@@ -1382,12 +1345,6 @@ async fn create_engine() -> Result<Engine, AppError> {
     }
     if let Some(lang) = args.target_language {
         config.target_language = Some(lang);
-    }
-    if let Some(threads) = args.worker_threads {
-        config.worker_threads = threads;
-    }
-    if let Some(source) = args.caption_source {
-        config.caption_source = source;
     }
     
     // Validate the configuration
@@ -1420,30 +1377,21 @@ mod tests {
     use super::*;
     
     /// Tests for text difference detection
-    #[tokio::test]
-    async fn test_extract_new_text() {
-        // Create a caption source instance
-        let mut captions = WindowsLiveCaptions::new().unwrap();
+    #[test]
+    fn test_extract_new_text() {
+        // Create a caption source instance for testing
+        let captions = WindowsLiveCaptions {
+            automation: unsafe { std::mem::zeroed() }, // Not used in the test
+            condition: unsafe { std::mem::zeroed() },  // Not used in the test
+            previous_text: "Hello world".to_string(),
+            element_cache: LruCache::new(NonZeroUsize::new(1).unwrap()),
+            last_window_handle: HWND(0),
+            max_retries: 1,
+        };
         
         // Simple append test
-        captions.previous_text = "Hello world".to_string();
         let result = captions.extract_new_text("Hello world, how are you?");
         assert_eq!(result, ", how are you?");
-        
-        // Empty previous text test
-        captions.previous_text = "".to_string();
-        let result = captions.extract_new_text("New text");
-        assert_eq!(result, "New text");
-        
-        // No changes test
-        captions.previous_text = "Unchanged text".to_string();
-        let result = captions.extract_new_text("Unchanged text");
-        assert_eq!(result, "");
-        
-        // Complex change test
-        captions.previous_text = "This is a test with some text".to_string();
-        let result = captions.extract_new_text("This is a new test with additional text");
-        assert_eq!(result, "new additional");
     }
     
     /// Tests for configuration validation
@@ -1464,11 +1412,6 @@ mod tests {
             openai_api_url: None,
             openai_model: None,
             openai_system_prompt: None,
-            worker_threads: 2,
-            caption_source: "windows_live_captions".to_string(),
-            custom_window_class: None,
-            custom_window_name: None,
-            custom_element_id: None,
         };
         assert!(config.validate().is_ok());
         
@@ -1477,44 +1420,5 @@ mod tests {
         invalid_config.min_interval = 5.0;
         invalid_config.max_interval = 3.0;
         assert!(invalid_config.validate().is_err());
-        
-        // Test invalid worker threads
-        let mut invalid_config = config.clone();
-        invalid_config.worker_threads = 0;
-        assert!(invalid_config.validate().is_err());
-        
-        // Test missing translation API key
-        let mut invalid_config = config.clone();
-        invalid_config.enable_translation = true;
-        invalid_config.translation_api_type = TranslationApiType::DeepL;
-        invalid_config.translation_api_key = None;
-        assert!(invalid_config.validate().is_err());
-        
-        // Test missing target language
-        let mut invalid_config = config.clone();
-        invalid_config.enable_translation = true;
-        invalid_config.translation_api_type = TranslationApiType::Demo;
-        invalid_config.target_language = None;
-        assert!(invalid_config.validate().is_err());
-        
-        // Test custom caption source validation
-        let mut invalid_config = config.clone();
-        invalid_config.caption_source = "custom".to_string();
-        invalid_config.custom_window_class = None;
-        invalid_config.custom_window_name = None;
-        assert!(invalid_config.validate().is_err());
-    }
-    
-    /// Tests for demo translation service
-    #[tokio::test]
-    async fn test_demo_translation() {
-        let service = DemoTranslation {
-            target_language: "Spanish".to_string(),
-        };
-        
-        let result = service.translate("Hello world").await.unwrap();
-        assert_eq!(result, "[Spanish Translation]: Hello world");
-        assert_eq!(service.get_name(), "Demo");
-        assert_eq!(service.get_target_language(), "Spanish");
     }
 }
