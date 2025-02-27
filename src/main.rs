@@ -235,18 +235,27 @@ impl Engine {
                 // 限制文本长度
                 self.limit_text_length();
                 info!("Final captions captured: {}", text);
-                println!("\n> Final caption: {}", self.displayed_text);
+                // 使用更兼容的方式显示最终字幕
+                println!("\n");
+                print!("> {}", self.displayed_text);
+                io::stdout().flush().ok();
             }
             Ok(None) => {
                 info!("No new captions at shutdown");
                 if !self.displayed_text.is_empty() {
-                    println!("\n> Final caption: {}", self.displayed_text);
+                    // 使用更兼容的方式显示最终字幕
+                    println!("\n");
+                    print!("> {}", self.displayed_text);
+                    io::stdout().flush().ok();
                 }
             }
             Err(err) => {
                 warn!("Could not capture final captions: {}", err);
                 if !self.displayed_text.is_empty() {
-                    println!("\n> Final caption: {}", self.displayed_text);
+                    // 使用更兼容的方式显示最终字幕
+                    println!("\n");
+                    print!("> {}", self.displayed_text);
+                    io::stdout().flush().ok();
                 }
             }
         }
@@ -309,8 +318,13 @@ async fn main() -> Result<()> {
                         // 限制文本长度
                         engine.limit_text_length();
                         
-                        // 清除当前行并显示完整的累积文本
-                        print!("\r\x1B[K> {}", engine.displayed_text);
+                        // 清除当前行并显示完整的累积文本 - 使用更兼容的方式
+                        print!("\r");  // 回车到行首
+                        // 用足够多的空格覆盖旧内容
+                        for _ in 0..120 {  // 假设终端宽度不超过120个字符
+                            print!(" ");
+                        }
+                        print!("\r> {}", engine.displayed_text);
                         io::stdout().flush().ok(); // 确保立即输出
                         
                         // 有新内容时重置连续空捕获计数并降低间隔
