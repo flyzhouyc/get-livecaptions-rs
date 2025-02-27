@@ -27,4 +27,5 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "UI_UIAutomation",
     "Win32_System_Memory",
+    "Win32_Foundation",
 ]

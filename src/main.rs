@@ -1,7 +1,7 @@
 use tokio::time::Duration;
 use std::process;
 use windows::{
-    core::*, Win32::{System::Com::*, UI::{Accessibility::*, WindowsAndMessaging::*}},
+    core::*, Win32::{System::Com::*, UI::{Accessibility::*, WindowsAndMessaging::*}, Foundation::HWND},
 };
 use clap::Parser;
 use log::{error, info, warn};
