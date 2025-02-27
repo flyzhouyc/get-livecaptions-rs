@@ -8,7 +8,7 @@ use clap::Parser;
 use log::{error, info, warn};
 use anyhow::{Result, Context, anyhow};
 use std::io::{self, Write};
-use std::borrow::Cow;
+//use std::borrow::Cow;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::fs;
