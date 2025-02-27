@@ -1,18 +1,56 @@
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use std::process;
 use std::path::PathBuf;
 use windows::{
-    core::*, Win32::{System::Com::*, UI::{Accessibility::*, WindowsAndMessaging::*}, Foundation::HWND},
+    core::*, Win32::System::Com::*, Win32::UI::{Accessibility::*, WindowsAndMessaging::*}, Win32::Foundation::HWND,
 };
 use clap::Parser;
 use log::{error, info, warn};
-use anyhow::{Result, Context, anyhow};
+use thiserror::Error;
+use anyhow::{Result, Context};
 use std::io::{self, Write};
-//use std::borrow::Cow;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::fs;
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
+use async_trait::async_trait;
+use std::sync::Arc;
+
+// Define custom error types for better error handling
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("UI automation error: {0}")]
+    UiAutomation(String),
+    
+    #[error("Translation error: {0}")]
+    Translation(String),
+    
+    #[error("Configuration error: {0}")]
+    Config(String),
+    
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("HTTP request error: {0}")]
+    Request(#[from] reqwest::Error),
+
+    #[error("COM error: {0}")]
+    Com(String),
+}
+
+// Implement From for windows errors
+impl From<windows::core::Error> for AppError {
+    fn from(err: windows::core::Error) -> Self {
+        AppError::Com(format!("{:?}", err))
+    }
+}
+
+// Define a trait for translation services
+#[async_trait]
+trait TranslationService: Send + Sync {
+    async fn translate(&self, text: &str) -> Result<String, AppError>;
+}
 
 // 翻译API类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,185 +61,255 @@ enum TranslationApiType {
     OpenAI,   // OpenAI 及兼容接口
 }
 
-// 翻译客户端结构体
-struct TranslationClient {
+// DeepL Translation Service
+struct DeepLTranslation {
     api_key: String,
     target_language: String,
     client: reqwest::Client,
-    api_type: TranslationApiType,
-    // OpenAI 特定字段
-    openai_api_url: Option<String>,
-    openai_model: Option<String>,
-    openai_system_prompt: Option<String>,
+    rate_limiter: RateLimiter,
 }
 
-impl TranslationClient {
-    fn new(
-        api_key: String, 
-        target_language: String, 
-        api_type: TranslationApiType,
-        openai_api_url: Option<String>,
-        openai_model: Option<String>,
-        openai_system_prompt: Option<String>,
-    ) -> Self {
+// Generic Translation Service
+struct GenericTranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    rate_limiter: RateLimiter,
+}
+
+// OpenAI Translation Service
+struct OpenAITranslation {
+    api_key: String,
+    target_language: String,
+    client: reqwest::Client,
+    api_url: String,
+    model: String,
+    system_prompt: String,
+    rate_limiter: RateLimiter,
+}
+
+// Demo Translation Service
+struct DemoTranslation;
+
+// Rate limiter to prevent API throttling
+struct RateLimiter {
+    last_request: Option<Instant>,
+    min_interval: Duration,
+}
+
+impl RateLimiter {
+    fn new(min_interval_ms: u64) -> Self {
         Self {
-            api_key,
-            target_language,
-            client: reqwest::Client::new(),
-            api_type,
-            openai_api_url,
-            openai_model,
-            openai_system_prompt,
+            last_request: None,
+            min_interval: Duration::from_millis(min_interval_ms),
         }
     }
     
-    async fn translate(&self, text: &str) -> Result<String> {
-        match self.api_type {
-            TranslationApiType::Demo => {
-                // 仅用于演示的简单"翻译"
-                Ok(format!("翻译: {}", text))
-            },
-            
-            TranslationApiType::DeepL => {
-                // DeepL API 调用 (免费版)
-                let url = "https://api-free.deepl.com/v2/translate";
-                
-                let response = self.client.post(url)
-                    .header("Authorization", format!("DeepL-Auth-Key {}", self.api_key))
-                    .form(&[
-                        ("text", text),
-                        ("target_lang", &self.target_language),
-                        ("source_lang", "EN"), // 假设源语言为英语，也可以设置为"auto"
-                    ])
-                    .send()
-                    .await
-                    .context("Failed to send translation request to DeepL")?;
-                    
-                if !response.status().is_success() {
-                    return Err(anyhow!("DeepL API error: {}", response.status()));
-                }
-                
-                #[derive(Deserialize)]
-                struct DeepLResponse {
-                    translations: Vec<Translation>,
-                }
-                
-                #[derive(Deserialize)]
-                struct Translation {
-                    text: String,
-                }
-                
-                let result: DeepLResponse = response.json()
-                    .await
-                    .context("Failed to parse DeepL response")?;
-                    
-                if let Some(translation) = result.translations.first() {
-                    Ok(translation.text.clone())
-                } else {
-                    Err(anyhow!("Empty translation result from DeepL"))
-                }
-            },
-            
-            TranslationApiType::Generic => {
-                // 通用API调用
-                let url = "https://translation-api.example.com/translate";
-                
-                let response = self.client.post(url)
-                    .header("Authorization", format!("Bearer {}", self.api_key))
-                    .json(&serde_json::json!({
-                        "text": text,
-                        "source_language": "auto",
-                        "target_language": self.target_language
-                    }))
-                    .send()
-                    .await
-                    .context("Failed to send translation request")?;
-                    
-                if !response.status().is_success() {
-                    return Err(anyhow!("Translation API error: {}", response.status()));
-                }
-                
-                let result: serde_json::Value = response.json()
-                    .await
-                    .context("Failed to parse translation response")?;
-                    
-                // 根据API响应格式提取翻译结果
-                result.get("translated_text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| anyhow!("Invalid translation response format"))
-            },
-            
-            TranslationApiType::OpenAI => {
-                // OpenAI 兼容 API 调用
-                // 获取 API URL，如果未指定则使用默认的 OpenAI URL
-                let url = self.openai_api_url.as_deref()
-                    .unwrap_or("https://api.openai.com/v1/chat/completions");
-                
-                // 获取模型名称，如果未指定则使用默认模型
-                let model = self.openai_model.as_deref()
-                    .unwrap_or("gpt-3.5-turbo");
-                
-                // 获取系统提示词，如果未指定则使用默认提示词
-                let system_prompt = self.openai_system_prompt.as_deref()
-                    .unwrap_or("You are a translator. Translate the following text to the target language. Only respond with the translation, no explanations.");
-                
-                // 构建请求体
-                let request_body = serde_json::json!({
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": system_prompt
-                        },
-                        {
-                            "role": "user",
-                            "content": format!("Translate the following text to {}: {}", self.target_language, text)
-                        }
-                    ],
-                    "temperature": 0.3
-                });
-                
-                // 发送请求
-                let response = self.client.post(url)
-                    .header("Authorization", format!("Bearer {}", self.api_key))
-                    .header("Content-Type", "application/json")
-                    .json(&request_body)
-                    .send()
-                    .await
-                    .context("Failed to send translation request to OpenAI compatible API")?;
-                    
-                if !response.status().is_success() {
-                    return Err(anyhow!("OpenAI API error: {}", response.status()));
-                }
-                
-                // 解析响应
-                #[derive(Deserialize)]
-                struct OpenAIResponse {
-                    choices: Vec<Choice>,
-                }
-                
-                #[derive(Deserialize)]
-                struct Choice {
-                    message: Message,
-                }
-                
-                #[derive(Deserialize)]
-                struct Message {
-                    content: String,
-                }
-                
-                let result: OpenAIResponse = response.json()
-                    .await
-                    .context("Failed to parse OpenAI response")?;
-                    
-                if let Some(choice) = result.choices.first() {
-                    Ok(choice.message.content.clone())
-                } else {
-                    Err(anyhow!("Empty translation result from OpenAI"))
-                }
+    async fn wait(&mut self) {
+        if let Some(last) = self.last_request {
+            let elapsed = last.elapsed();
+            if elapsed < self.min_interval {
+                tokio::time::sleep(self.min_interval - elapsed).await;
             }
         }
+        self.last_request = Some(Instant::now());
+    }
+}
+
+#[async_trait]
+impl TranslationService for DemoTranslation {
+    async fn translate(&self, text: &str) -> Result<String, AppError> {
+        Ok(format!("翻译: {}", text))
+    }
+}
+
+#[async_trait]
+impl TranslationService for DeepLTranslation {
+    async fn translate(&self, text: &str) -> Result<String, AppError> {
+        // Rate limiting
+        self.rate_limiter.wait().await;
+        
+        // DeepL API 调用 (免费版)
+        let url = "https://api-free.deepl.com/v2/translate";
+        
+        let response = self.client.post(url)
+            .header("Authorization", format!("DeepL-Auth-Key {}", self.api_key))
+            .form(&[
+                ("text", text),
+                ("target_lang", &self.target_language),
+                ("source_lang", "EN"), // 假设源语言为英语，也可以设置为"auto"
+            ])
+            .send()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to send translation request to DeepL: {}", e)))?;
+                
+        if !response.status().is_success() {
+            return Err(AppError::Translation(format!("DeepL API error: {}", response.status())));
+        }
+        
+        #[derive(Deserialize)]
+        struct DeepLResponse {
+            translations: Vec<Translation>,
+        }
+        
+        #[derive(Deserialize)]
+        struct Translation {
+            text: String,
+        }
+        
+        let result: DeepLResponse = response.json()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to parse DeepL response: {}", e)))?;
+                
+        if let Some(translation) = result.translations.first() {
+            Ok(translation.text.clone())
+        } else {
+            Err(AppError::Translation("Empty translation result from DeepL".to_string()))
+        }
+    }
+}
+
+#[async_trait]
+impl TranslationService for GenericTranslation {
+    async fn translate(&self, text: &str) -> Result<String, AppError> {
+        // Rate limiting
+        self.rate_limiter.wait().await;
+        
+        // 通用API调用
+        let url = "https://translation-api.example.com/translate";
+        
+        let response = self.client.post(url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({
+                "text": text,
+                "source_language": "auto",
+                "target_language": self.target_language
+            }))
+            .send()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to send translation request: {}", e)))?;
+                
+        if !response.status().is_success() {
+            return Err(AppError::Translation(format!("Translation API error: {}", response.status())));
+        }
+        
+        let result: serde_json::Value = response.json()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to parse translation response: {}", e)))?;
+                
+        // 根据API响应格式提取翻译结果
+        result.get("translated_text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| AppError::Translation("Invalid translation response format".to_string()))
+    }
+}
+
+#[async_trait]
+impl TranslationService for OpenAITranslation {
+    async fn translate(&self, text: &str) -> Result<String, AppError> {
+        // Rate limiting
+        self.rate_limiter.wait().await;
+        
+        // 构建请求体
+        let request_body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": format!("Translate the following text to {}: {}", self.target_language, text)
+                }
+            ],
+            "temperature": 0.3
+        });
+        
+        // 发送请求
+        let response = self.client.post(&self.api_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to send translation request to OpenAI compatible API: {}", e)))?;
+                
+        if !response.status().is_success() {
+            return Err(AppError::Translation(format!("OpenAI API error: {}", response.status())));
+        }
+        
+        // 解析响应
+        #[derive(Deserialize)]
+        struct OpenAIResponse {
+            choices: Vec<Choice>,
+        }
+        
+        #[derive(Deserialize)]
+        struct Choice {
+            message: Message,
+        }
+        
+        #[derive(Deserialize)]
+        struct Message {
+            content: String,
+        }
+        
+        let result: OpenAIResponse = response.json()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to parse OpenAI response: {}", e)))?;
+                
+        if let Some(choice) = result.choices.first() {
+            Ok(choice.message.content.clone())
+        } else {
+            Err(AppError::Translation("Empty translation result from OpenAI".to_string()))
+        }
+    }
+}
+
+// Factory function to create the appropriate translation service
+fn create_translation_service(
+    api_key: String,
+    target_language: String,
+    api_type: TranslationApiType,
+    openai_api_url: Option<String>,
+    openai_model: Option<String>,
+    openai_system_prompt: Option<String>,
+) -> Arc<dyn TranslationService> {
+    match api_type {
+        TranslationApiType::Demo => {
+            Arc::new(DemoTranslation)
+        },
+        TranslationApiType::DeepL => {
+            Arc::new(DeepLTranslation {
+                api_key,
+                target_language,
+                client: reqwest::Client::new(),
+                rate_limiter: RateLimiter::new(500), // 500ms between requests
+            })
+        },
+        TranslationApiType::Generic => {
+            Arc::new(GenericTranslation {
+                api_key,
+                target_language,
+                client: reqwest::Client::new(),
+                rate_limiter: RateLimiter::new(500),
+            })
+        },
+        TranslationApiType::OpenAI => {
+            Arc::new(OpenAITranslation {
+                api_key,
+                target_language,
+                client: reqwest::Client::new(),
+                api_url: openai_api_url.unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string()),
+                model: openai_model.unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+                system_prompt: openai_system_prompt.unwrap_or_else(|| 
+                    "You are a translator. Translate the following text to the target language. Only respond with the translation, no explanations.".to_string()
+                ),
+                rate_limiter: RateLimiter::new(1000), // OpenAI might need more time between requests
+            })
+        },
     }
 }
 
@@ -254,30 +362,30 @@ impl Default for Config {
 
 impl Config {
     // 从文件加载配置
-    fn load(path: &PathBuf) -> Result<Self> {
+    fn load(path: &PathBuf) -> Result<Self, AppError> {
         if path.exists() {
             let content = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config file: {:?}", path))?;
+                .map_err(|e| AppError::Config(format!("Failed to read config file: {:?}: {}", path, e)))?;
             serde_json::from_str(&content)
-                .with_context(|| format!("Failed to parse config file: {:?}", path))
+                .map_err(|e| AppError::Config(format!("Failed to parse config file: {:?}: {}", path, e)))
         } else {
             // 如果配置文件不存在，创建默认配置
             let config = Config::default();
             let content = serde_json::to_string_pretty(&config)
-                .context("Failed to serialize default config")?;
+                .map_err(|e| AppError::Config(format!("Failed to serialize default config: {}", e)))?;
             fs::write(path, content)
-                .with_context(|| format!("Failed to write default config to {:?}", path))?;
+                .map_err(|e| AppError::Config(format!("Failed to write default config to {:?}: {}", path, e)))?;
             info!("Created default config at {:?}", path);
             Ok(config)
         }
     }
     
     // 保存配置到文件
-    fn save(&self, path: &PathBuf) -> Result<()> {
+    fn save(&self, path: &PathBuf) -> Result<(), AppError> {
         let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+            .map_err(|e| AppError::Config(format!("Failed to serialize config: {}", e)))?;
         fs::write(path, content)
-            .with_context(|| format!("Failed to write config to {:?}", path))?;
+            .map_err(|e| AppError::Config(format!("Failed to write config to {:?}: {}", path, e)))?;
         info!("Saved config to {:?}", path);
         Ok(())
     }
@@ -332,23 +440,21 @@ impl Drop for Engine {
 }
 
 impl Engine {
-    fn new() -> Result<Self> {
+    fn new() -> Result<Self, AppError> {
         unsafe { 
             // 修复错误：正确处理HRESULT
             let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
             if hr.is_err() {
-                return Err(anyhow!("Failed to initialize Windows COM: {:?}", hr));
+                return Err(AppError::Com(format!("Failed to initialize Windows COM: {:?}", hr)));
             }
         }
 
         let automation: IUIAutomation = unsafe { 
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)
-                .map_err(|e| anyhow!("Failed to initialize Windows Accessibility API: {:?}", e))?
+            CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL)?
         };
         
         let condition = unsafe { 
-            automation.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("CaptionsTextBlock"))
-                .map_err(|e| anyhow!("Failed to create property condition: {:?}", e))?
+            automation.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("CaptionsTextBlock"))?
         };
         
         // 默认配置值
@@ -374,67 +480,43 @@ impl Engine {
         })
     }
 
-    // 使用 Myers 差异算法的文本差异检测
-    fn extract_new_text<'a>(&self, current: &'a str) -> std::borrow::Cow<'a, str> {
-        use std::borrow::Cow;
-        
+    // 使用 similar 库的差异检测算法
+    fn extract_new_text<'a>(&self, current: &'a str) -> String {
         if self.previous_text.is_empty() {
-            return Cow::Borrowed(current);
+            return current.to_string();
         }
         
-        // 对于非常长的文本，使用滑动窗口方法减少比较范围
-        if current.len() > 1000 && self.previous_text.len() > 1000 {
-            // 假设新内容主要添加在末尾，从后半部分开始比较
-            let window_start = self.previous_text.len().saturating_sub(500);
-            let prev_window = &self.previous_text[window_start..];
-            
-            // 如果当前文本包含前一个窗口的内容，找出差异部分
-            if let Some(pos) = current.find(prev_window) {
-                if pos + prev_window.len() < current.len() {
-                    // 返回窗口后的新内容
-                    return Cow::Borrowed(&current[(pos + prev_window.len())..]);
-                }
+        // 使用 similar 库计算差异
+        let diff = TextDiff::from_chars(&self.previous_text, current);
+        
+        // 只提取添加的部分
+        let mut new_text = String::new();
+        for change in diff.iter_all_changes() {
+            if change.tag() == ChangeTag::Insert {
+                new_text.push(change.value().chars().next().unwrap_or(' '));
             }
         }
         
-        // 实现简化版的 Myers 差异算法来查找最长公共子序列
-        // 这里使用前缀匹配作为高效近似
-        let mut i = 0;
-        let prev_bytes = self.previous_text.as_bytes();
-        let curr_bytes = current.as_bytes();
-        
-        // 查找共同前缀长度
-        while i < prev_bytes.len() && i < curr_bytes.len() && prev_bytes[i] == curr_bytes[i] {
-            i += 1;
+        // 如果差异检测没有发现新内容但文本确实不同，则返回整个文本
+        if new_text.is_empty() && current != self.previous_text {
+            return current.to_string();
         }
         
-        // 如果有新增内容，返回
-        if i < curr_bytes.len() {
-            let new_content = &current[i..];
-            // 确保从完整单词或句子开始（避免截断单词）
-            if i > 0 && !new_content.starts_with(char::is_whitespace) {
-                // 找到第一个空格后的位置
-                if let Some(pos) = new_content.find(char::is_whitespace) {
-                    if pos + 1 < new_content.len() {
-                        return Cow::Borrowed(&new_content[pos+1..]);
-                    }
-                }
-            }
-            return Cow::Borrowed(new_content);
-        }
-        
-        // 如果当前文本完全不同于之前的文本，返回整个当前文本
-        if i == 0 && current != self.previous_text {
-            return Cow::Borrowed(current);
-        }
-        
-        Cow::Borrowed("")
+        new_text
     }
 
-    async fn get_livecaptions(&mut self) -> Result<Option<String>> {
+    // 检查元素是否有效
+    fn is_element_valid(element: &IUIAutomationElement) -> bool {
+        // 尝试获取一个属性来检查元素是否仍然有效
+        unsafe { 
+            element.CurrentProcessId().is_ok()
+        }
+    }
+
+    async fn get_livecaptions(&mut self) -> Result<Option<String>, AppError> {
         let window = unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None) };
         if window.0 == 0 {
-            return Err(anyhow!("Live Captions window not found"));
+            return Err(AppError::UiAutomation("Live Captions window not found".to_string()));
         }
         
         // 检查窗口是否发生变化，只有需要时才清理缓存
@@ -451,10 +533,17 @@ impl Engine {
         // 获取或缓存窗口元素
         let window_key = CacheKey::WindowElement(window_handle_value);
         let window_element = if let Some(element) = self.element_cache.get(&window_key) {
-            element.clone()
+            if Self::is_element_valid(element) {
+                element.clone()
+            } else {
+                // 元素无效，从缓存中移除并获取新元素
+                self.element_cache.pop(&window_key);
+                let element = unsafe { self.automation.ElementFromHandle(window) }?;
+                self.element_cache.put(window_key, element.clone());
+                element
+            }
         } else {
-            let element = unsafe { self.automation.ElementFromHandle(window) }
-                .map_err(|e| anyhow!("Failed to get element from window handle: {:?}", e))?;
+            let element = unsafe { self.automation.ElementFromHandle(window) }?;
             self.element_cache.put(window_key, element.clone());
             element
         };
@@ -462,23 +551,33 @@ impl Engine {
         // 获取或缓存文本元素
         let text_key = CacheKey::TextElement(window_handle_value);
         let text_element = if let Some(element) = self.element_cache.get(&text_key) {
-            element.clone()
+            if Self::is_element_valid(element) {
+                element.clone()
+            } else {
+                // 元素无效，从缓存中移除并获取新元素
+                self.element_cache.pop(&text_key);
+                let element = unsafe { window_element.FindFirst(TreeScope_Descendants, &self.condition) }?;
+                self.element_cache.put(text_key, element.clone());
+                element
+            }
         } else {
-            let element = unsafe { window_element.FindFirst(TreeScope_Descendants, &self.condition) }
-                .map_err(|e| anyhow!("Failed to find captions text element: {:?}", e))?;
+            let element = unsafe { window_element.FindFirst(TreeScope_Descendants, &self.condition) }?;
             self.element_cache.put(text_key, element.clone());
             element
         };
         
         // 从文本元素获取字幕内容
-        let current_text = unsafe { text_element.CurrentName() }
-            .map_err(|e| {
-                // 如果获取文本失败，可能是元素已失效，清除缓存以便下次重新获取
-                self.element_cache.pop(&window_key);
-                self.element_cache.pop(&text_key);
-                anyhow!("Failed to get text from element: {:?}", e)
-            })?
-            .to_string();
+        let current_text = unsafe { 
+            match text_element.CurrentName() {
+                Ok(name) => name.to_string(),
+                Err(e) => {
+                    // 如果获取文本失败，可能是元素已失效，清除缓存以便下次重新获取
+                    self.element_cache.pop(&window_key);
+                    self.element_cache.pop(&text_key);
+                    return Err(AppError::UiAutomation(format!("Failed to get text from element: {:?}", e)));
+                }
+            }
+        };
         
         // 如果文本为空或与上次相同，返回None
         if current_text.is_empty() || current_text == self.previous_text {
@@ -488,18 +587,18 @@ impl Engine {
         // 使用优化的文本差异检测算法提取新增内容
         let new_text = self.extract_new_text(&current_text);
         
-        // 更新上一次的文本（克隆以避免借用冲突）
-        self.previous_text = current_text.clone();
+        // 更新上一次的文本
+        self.previous_text = current_text;
         
         if !new_text.is_empty() {
-            Ok(Some(new_text.into_owned()))
+            Ok(Some(new_text))
         } else {
             Ok(None)
         }
     }
     
     // 添加重试逻辑
-    async fn get_livecaptions_with_retry(&mut self, max_retries: usize) -> Result<Option<String>> {
+    async fn get_livecaptions_with_retry(&mut self, max_retries: usize) -> Result<Option<String>, AppError> {
         let mut attempts = 0;
         let mut last_error = None;
         
@@ -520,27 +619,39 @@ impl Engine {
             }
         }
         
-        Err(last_error.unwrap_or_else(|| anyhow!("Unknown error after retries")))
+        Err(last_error.unwrap_or_else(|| AppError::UiAutomation("Unknown error after retries".to_string())))
     }
 
-    // 限制文本长度，防止内存无限增长
+    // 改进的文本长度限制方法
     fn limit_text_length(&mut self) {
         if self.displayed_text.len() > self.max_text_length {
-            // 保留后半部分文本，丢弃前半部分
-            let start_pos = self.displayed_text.len() - self.max_text_length / 2;
-            // 找到一个合适的断句点（如空格或标点）
-            if let Some(pos) = self.displayed_text[start_pos..].find(|c: char| c.is_whitespace() || c == '.' || c == ',' || c == '!' || c == '?') {
-                self.displayed_text = self.displayed_text[(start_pos + pos + 1)..].to_string();
-                info!("Text truncated to {} characters", self.displayed_text.len());
-            } else {
-                // 如果找不到合适的断句点，直接截断
-                self.displayed_text = self.displayed_text[start_pos..].to_string();
-                info!("Text truncated to {} characters", self.displayed_text.len());
+            // 按句子分割文本
+            let sentences: Vec<&str> = self.displayed_text
+                .split(|c| c == '.' || c == '!' || c == '?' || c == '\n')
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            
+            // 保留固定数量的最近句子
+            let max_sentences = 20; // 保留最后20个句子
+            if sentences.len() > max_sentences {
+                let start_idx = sentences.len() - max_sentences;
+                // 重新组合句子，添加分隔符
+                let mut new_text = String::new();
+                for (i, sentence) in sentences[start_idx..].iter().enumerate() {
+                    if i > 0 {
+                        // 添加适当的分隔符
+                        new_text.push_str(". ");
+                    }
+                    new_text.push_str(sentence.trim());
+                }
+                
+                self.displayed_text = new_text;
+                info!("Text truncated to {} sentences", max_sentences);
             }
         }
     }
 
-    async fn graceful_shutdown(&mut self) -> Result<()> {
+    async fn graceful_shutdown(&mut self) -> Result<(), AppError> {
         info!("Performing graceful shutdown");
         // 使用带重试的方法获取最终字幕
         match self.get_livecaptions_with_retry(3).await {
@@ -582,6 +693,40 @@ impl Engine {
 
 fn is_livecaptions_running() -> bool {
     unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None).0 != 0 }
+}
+
+// 异步处理捕获的文本（包括翻译）
+async fn process_caption(
+    text: String, 
+    translation_service: Option<&Arc<dyn TranslationService>>
+) -> Result<String, AppError> {
+    if let Some(service) = translation_service {
+        match service.translate(&text).await {
+            Ok(translated) => {
+                info!("Translated: {} -> {}", text, translated);
+                Ok(format!("{} [{}]", text, translated))
+            }
+            Err(e) => {
+                warn!("Translation failed: {}", e);
+                Ok(text)
+            }
+        }
+    } else {
+        Ok(text)
+    }
+}
+
+// 使用crossterm清除当前行并显示文本
+fn display_text(text: &str) -> Result<(), AppError> {
+    // 使用标准输出方法，但更高效地清除行
+    print!("\r");  // 回车到行首
+    // 用足够多的空格覆盖旧内容
+    for _ in 0..120 {  // 假设终端宽度不超过120个字符
+        print!(" ");
+    }
+    print!("\r> {}", text);
+    io::stdout().flush()?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -673,8 +818,8 @@ async fn main() -> Result<()> {
     println!("Press Ctrl+C to exit");
     println!("-----------------------------------");
     
-    // 创建翻译客户端（如果启用）
-    let translation_client = if config.enable_translation {
+    // 创建翻译服务（如果启用）
+    let translation_service = if config.enable_translation {
         if let Some(api_key) = &config.translation_api_key {
             // 确定API类型
             let api_type = match config.translation_api_type.as_deref() {
@@ -695,7 +840,7 @@ async fn main() -> Result<()> {
             });
             
             info!("Initializing translation service with {:?} API", api_type);
-            Some(TranslationClient::new(
+            Some(create_translation_service(
                 api_key.clone(),
                 target_lang,
                 api_type,
@@ -728,40 +873,28 @@ async fn main() -> Result<()> {
                 // 使用带重试的方法获取字幕
                 match engine.get_livecaptions_with_retry(2).await {
                     Ok(Some(text)) => {
-                        // 处理翻译（如果启用）
-                        let display_text = if let Some(client) = &translation_client {
-                            match client.translate(&text).await {
-                                Ok(translated) => {
-                                    info!("Translated: {} -> {}", text, translated);
-                                    format!("{} [{}]", text, translated)
-                                }
-                                Err(e) => {
-                                    warn!("Translation failed: {}", e);
-                                    text.clone()
-                                }
-                            }
-                        } else {
-                            text.clone()
-                        };
+                        // 使用异步方法处理捕获的文本（包括翻译）
+                        let text_clone = text.clone();
+                        let processed_text = process_caption(text_clone, translation_service.as_ref()).await
+                            .unwrap_or_else(|e| {
+                                warn!("Error processing caption: {}", e);
+                                text.clone()
+                            });
                         
                         // 将新文本追加到已显示的文本中
-                        engine.displayed_text.push_str(&display_text);
+                        engine.displayed_text.push_str(&processed_text);
                         
                         // 限制文本长度
                         engine.limit_text_length();
                         
-                        // 清除当前行并显示完整的累积文本 - 使用更兼容的方式
-                        print!("\r");  // 回车到行首
-                        // 用足够多的空格覆盖旧内容
-                        for _ in 0..120 {  // 假设终端宽度不超过120个字符
-                            print!(" ");
+                        // 显示文本
+                        if let Err(e) = display_text(&engine.displayed_text) {
+                            warn!("Error displaying text: {}", e);
                         }
-                        print!("\r> {}", engine.displayed_text);
-                        io::stdout().flush().ok(); // 确保立即输出
                         
                         // 如果配置了输出文件，写入文件
                         if let Some(file) = &mut output_file {
-                            if let Err(e) = writeln!(file, "{}", display_text) {
+                            if let Err(e) = writeln!(file, "{}", processed_text) {
                                 warn!("Failed to write to output file: {}", e);
                             }
                         }
