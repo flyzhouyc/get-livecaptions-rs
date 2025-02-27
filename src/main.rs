@@ -14,60 +14,109 @@ use std::num::NonZeroUsize;
 use std::fs;
 use serde::{Deserialize, Serialize};
 
+// 翻译API类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranslationApiType {
+    DeepL,    // DeepL API
+    Generic,  // 通用API
+    Demo,     // 演示模式
+}
+
 // 翻译客户端结构体
 struct TranslationClient {
     api_key: String,
     target_language: String,
     client: reqwest::Client,
+    api_type: TranslationApiType,
 }
 
 impl TranslationClient {
-    fn new(api_key: String, target_language: String) -> Self {
+    fn new(api_key: String, target_language: String, api_type: TranslationApiType) -> Self {
         Self {
             api_key,
             target_language,
             client: reqwest::Client::new(),
+            api_type,
         }
     }
     
     async fn translate(&self, text: &str) -> Result<String> {
-        // 这里使用的是模拟翻译API，实际应用中需要替换为真实的API
-        // 例如可以使用Google Translate API、Microsoft Translator API等
-        
-        // 简单模拟翻译，实际应用中应该调用真实的API
-        if self.api_key == "demo" {
-            // 仅用于演示的简单"翻译"
-            return Ok(format!("翻译: {}", text));
-        }
-        
-        // 实际的API调用示例（需要根据具体API调整）
-        let url = "https://translation-api.example.com/translate";
-        
-        let response = self.client.post(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&serde_json::json!({
-                "text": text,
-                "source_language": "auto",
-                "target_language": self.target_language
-            }))
-            .send()
-            .await
-            .context("Failed to send translation request")?;
+        match self.api_type {
+            TranslationApiType::Demo => {
+                // 仅用于演示的简单"翻译"
+                Ok(format!("翻译: {}", text))
+            },
             
-        if !response.status().is_success() {
-            return Err(anyhow!("Translation API error: {}", response.status()));
-        }
-        
-        let result: serde_json::Value = response.json()
-            .await
-            .context("Failed to parse translation response")?;
+            TranslationApiType::DeepL => {
+                // DeepL API 调用 (免费版)
+                let url = "https://api-free.deepl.com/v2/translate";
+                
+                let response = self.client.post(url)
+                    .header("Authorization", format!("DeepL-Auth-Key {}", self.api_key))
+                    .form(&[
+                        ("text", text),
+                        ("target_lang", &self.target_language),
+                        ("source_lang", "EN"), // 假设源语言为英语，也可以设置为"auto"
+                    ])
+                    .send()
+                    .await
+                    .context("Failed to send translation request to DeepL")?;
+                    
+                if !response.status().is_success() {
+                    return Err(anyhow!("DeepL API error: {}", response.status()));
+                }
+                
+                #[derive(Deserialize)]
+                struct DeepLResponse {
+                    translations: Vec<Translation>,
+                }
+                
+                #[derive(Deserialize)]
+                struct Translation {
+                    text: String,
+                }
+                
+                let result: DeepLResponse = response.json()
+                    .await
+                    .context("Failed to parse DeepL response")?;
+                    
+                if let Some(translation) = result.translations.first() {
+                    Ok(translation.text.clone())
+                } else {
+                    Err(anyhow!("Empty translation result from DeepL"))
+                }
+            },
             
-        // 根据API响应格式提取翻译结果
-        // 这里假设API返回的JSON格式为 {"translated_text": "..."}
-        result.get("translated_text")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("Invalid translation response format"))
+            TranslationApiType::Generic => {
+                // 通用API调用
+                let url = "https://translation-api.example.com/translate";
+                
+                let response = self.client.post(url)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .json(&serde_json::json!({
+                        "text": text,
+                        "source_language": "auto",
+                        "target_language": self.target_language
+                    }))
+                    .send()
+                    .await
+                    .context("Failed to send translation request")?;
+                    
+                if !response.status().is_success() {
+                    return Err(anyhow!("Translation API error: {}", response.status()));
+                }
+                
+                let result: serde_json::Value = response.json()
+                    .await
+                    .context("Failed to parse translation response")?;
+                    
+                // 根据API响应格式提取翻译结果
+                result.get("translated_text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow!("Invalid translation response format"))
+            }
+        }
     }
 }
 
@@ -89,6 +138,7 @@ struct Config {
     // 翻译设置
     enable_translation: bool,    // 是否启用翻译
     translation_api_key: Option<String>, // 翻译API密钥（可选）
+    translation_api_type: Option<String>, // 翻译API类型（"deepl", "generic", "demo"）
     target_language: Option<String>,    // 目标语言（可选）
 }
 
@@ -103,6 +153,7 @@ impl Default for Config {
             output_file: None,
             enable_translation: false,
             translation_api_key: None,
+            translation_api_type: Some("deepl".to_string()), // 默认使用DeepL API
             target_language: None,
         }
     }
@@ -532,10 +583,29 @@ async fn main() -> Result<()> {
     // 创建翻译客户端（如果启用）
     let translation_client = if config.enable_translation {
         if let Some(api_key) = &config.translation_api_key {
-            info!("Initializing translation service");
+            // 确定API类型
+            let api_type = match config.translation_api_type.as_deref() {
+                Some("deepl") => TranslationApiType::DeepL,
+                Some("generic") => TranslationApiType::Generic,
+                Some("demo") => TranslationApiType::Demo,
+                _ => TranslationApiType::DeepL, // 默认使用DeepL
+            };
+            
+            // 确定目标语言
+            let target_lang = config.target_language.clone().unwrap_or_else(|| {
+                // 对于DeepL API，使用大写语言代码
+                if api_type == TranslationApiType::DeepL {
+                    "ZH".to_string()
+                } else {
+                    "zh-CN".to_string()
+                }
+            });
+            
+            info!("Initializing translation service with {:?} API", api_type);
             Some(TranslationClient::new(
                 api_key.clone(),
-                config.target_language.clone().unwrap_or_else(|| "zh-CN".to_string())
+                target_lang,
+                api_type
             ))
         } else {
             warn!("Translation enabled but no API key provided");
