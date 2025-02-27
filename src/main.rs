@@ -344,8 +344,8 @@ impl Engine {
         // 使用优化的文本差异检测算法提取新增内容
         let new_text = self.extract_new_text(&current_text);
         
-        // 更新上一次的文本
-        self.previous_text = current_text;
+        // 更新上一次的文本（克隆以避免借用冲突）
+        self.previous_text = current_text.clone();
         
         if !new_text.is_empty() {
             Ok(Some(new_text.into_owned()))
