@@ -12,7 +12,7 @@ use std::io::{self, Write};
 #[command(version, about, long_about = None)]
 struct Args {
     /// Interval of seconds for capturing captions
-    #[arg(short, long, default_value_t = 1.0)]
+    #[arg(short = 'i', long, default_value_t = 1.0)]
     capture_interval: f64,   
 
     /// Interval of seconds for checking if Live Captions is running
@@ -24,6 +24,7 @@ struct Engine {
     automation: IUIAutomation,
     condition: IUIAutomationCondition,
     previous_text: String,
+    displayed_text: String, // 用于跟踪显示在终端的文本
 }
 
 impl Drop for Engine {
@@ -57,6 +58,7 @@ impl Engine {
             automation,
             condition,
             previous_text: String::new(),
+            displayed_text: String::new(),
         })
     }
 
@@ -108,14 +110,22 @@ impl Engine {
         info!("Performing graceful shutdown");
         match self.get_livecaptions().await {
             Ok(Some(text)) => {
+                // 将最后的文本追加到显示文本中
+                self.displayed_text.push_str(&text);
                 info!("Final captions captured: {}", text);
-                println!("\n> Final caption: {}", text);
+                println!("\n> Final caption: {}", self.displayed_text);
             }
             Ok(None) => {
                 info!("No new captions at shutdown");
+                if !self.displayed_text.is_empty() {
+                    println!("\n> Final caption: {}", self.displayed_text);
+                }
             }
             Err(err) => {
                 warn!("Could not capture final captions: {}", err);
+                if !self.displayed_text.is_empty() {
+                    println!("\n> Final caption: {}", self.displayed_text);
+                }
             }
         }
         
@@ -170,8 +180,11 @@ async fn main() -> Result<()> {
                 info!("Capturing live captions");
                 match engine.get_livecaptions().await {
                     Ok(Some(text)) => {
-                        // 逐行显示字幕
-                        print!("> {}\n", text);
+                        // 将新文本追加到已显示的文本中
+                        engine.displayed_text.push_str(&text);
+                        
+                        // 清除当前行并显示完整的累积文本
+                        print!("\r\x1B[K> {}", engine.displayed_text);
                         io::stdout().flush().ok(); // 确保立即输出
                     },
                     Ok(None) => {
