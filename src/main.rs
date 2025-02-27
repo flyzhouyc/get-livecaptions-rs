@@ -20,6 +20,7 @@ enum TranslationApiType {
     DeepL,    // DeepL API
     Generic,  // 通用API
     Demo,     // 演示模式
+    OpenAI,   // OpenAI 及兼容接口
 }
 
 // 翻译客户端结构体
@@ -28,15 +29,29 @@ struct TranslationClient {
     target_language: String,
     client: reqwest::Client,
     api_type: TranslationApiType,
+    // OpenAI 特定字段
+    openai_api_url: Option<String>,
+    openai_model: Option<String>,
+    openai_system_prompt: Option<String>,
 }
 
 impl TranslationClient {
-    fn new(api_key: String, target_language: String, api_type: TranslationApiType) -> Self {
+    fn new(
+        api_key: String, 
+        target_language: String, 
+        api_type: TranslationApiType,
+        openai_api_url: Option<String>,
+        openai_model: Option<String>,
+        openai_system_prompt: Option<String>,
+    ) -> Self {
         Self {
             api_key,
             target_language,
             client: reqwest::Client::new(),
             api_type,
+            openai_api_url,
+            openai_model,
+            openai_system_prompt,
         }
     }
     
@@ -115,6 +130,76 @@ impl TranslationClient {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .ok_or_else(|| anyhow!("Invalid translation response format"))
+            },
+            
+            TranslationApiType::OpenAI => {
+                // OpenAI 兼容 API 调用
+                // 获取 API URL，如果未指定则使用默认的 OpenAI URL
+                let url = self.openai_api_url.as_deref()
+                    .unwrap_or("https://api.openai.com/v1/chat/completions");
+                
+                // 获取模型名称，如果未指定则使用默认模型
+                let model = self.openai_model.as_deref()
+                    .unwrap_or("gpt-3.5-turbo");
+                
+                // 获取系统提示词，如果未指定则使用默认提示词
+                let system_prompt = self.openai_system_prompt.as_deref()
+                    .unwrap_or("You are a translator. Translate the following text to the target language. Only respond with the translation, no explanations.");
+                
+                // 构建请求体
+                let request_body = serde_json::json!({
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": system_prompt
+                        },
+                        {
+                            "role": "user",
+                            "content": format!("Translate the following text to {}: {}", self.target_language, text)
+                        }
+                    ],
+                    "temperature": 0.3
+                });
+                
+                // 发送请求
+                let response = self.client.post(url)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&request_body)
+                    .send()
+                    .await
+                    .context("Failed to send translation request to OpenAI compatible API")?;
+                    
+                if !response.status().is_success() {
+                    return Err(anyhow!("OpenAI API error: {}", response.status()));
+                }
+                
+                // 解析响应
+                #[derive(Deserialize)]
+                struct OpenAIResponse {
+                    choices: Vec<Choice>,
+                }
+                
+                #[derive(Deserialize)]
+                struct Choice {
+                    message: Message,
+                }
+                
+                #[derive(Deserialize)]
+                struct Message {
+                    content: String,
+                }
+                
+                let result: OpenAIResponse = response.json()
+                    .await
+                    .context("Failed to parse OpenAI response")?;
+                    
+                if let Some(choice) = result.choices.first() {
+                    Ok(choice.message.content.clone())
+                } else {
+                    Err(anyhow!("Empty translation result from OpenAI"))
+                }
             }
         }
     }
@@ -138,8 +223,13 @@ struct Config {
     // 翻译设置
     enable_translation: bool,    // 是否启用翻译
     translation_api_key: Option<String>, // 翻译API密钥（可选）
-    translation_api_type: Option<String>, // 翻译API类型（"deepl", "generic", "demo"）
+    translation_api_type: Option<String>, // 翻译API类型（"deepl", "generic", "demo", "openai"）
     target_language: Option<String>,    // 目标语言（可选）
+    
+    // OpenAI 相关配置
+    openai_api_url: Option<String>,     // API 端点 URL
+    openai_model: Option<String>,       // 模型名称
+    openai_system_prompt: Option<String>, // 系统提示词
 }
 
 impl Default for Config {
@@ -155,6 +245,9 @@ impl Default for Config {
             translation_api_key: None,
             translation_api_type: Some("deepl".to_string()), // 默认使用DeepL API
             target_language: None,
+            openai_api_url: None,
+            openai_model: None,
+            openai_system_prompt: None,
         }
     }
 }
@@ -588,16 +681,16 @@ async fn main() -> Result<()> {
                 Some("deepl") => TranslationApiType::DeepL,
                 Some("generic") => TranslationApiType::Generic,
                 Some("demo") => TranslationApiType::Demo,
+                Some("openai") => TranslationApiType::OpenAI,
                 _ => TranslationApiType::DeepL, // 默认使用DeepL
             };
             
             // 确定目标语言
             let target_lang = config.target_language.clone().unwrap_or_else(|| {
-                // 对于DeepL API，使用大写语言代码
-                if api_type == TranslationApiType::DeepL {
-                    "ZH".to_string()
-                } else {
-                    "zh-CN".to_string()
+                match api_type {
+                    TranslationApiType::DeepL => "ZH".to_string(), // DeepL 使用大写语言代码
+                    TranslationApiType::OpenAI => "Chinese".to_string(), // OpenAI 使用自然语言描述
+                    _ => "zh-CN".to_string(),
                 }
             });
             
@@ -605,7 +698,10 @@ async fn main() -> Result<()> {
             Some(TranslationClient::new(
                 api_key.clone(),
                 target_lang,
-                api_type
+                api_type,
+                config.openai_api_url.clone(),
+                config.openai_model.clone(),
+                config.openai_system_prompt.clone()
             ))
         } else {
             warn!("Translation enabled but no API key provided");
