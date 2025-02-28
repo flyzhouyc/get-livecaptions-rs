@@ -1306,10 +1306,10 @@ impl TranslationWindow {
         // Add each sentence with proper formatting
         for (_, sentence) in &self.sentences {
             // Add original text with formatting
-            self.displayed_text.push_str(&format!("[原文] {}\n", sentence.original));
+            self.displayed_text.push_str(&format!("[Original] {}\n", sentence.original));
             
             // Add translation with formatting
-            self.displayed_text.push_str(&format!("[译文] {}\n\n", sentence.translation));
+            self.displayed_text.push_str(&format!("[Translation] {}\n\n", sentence.translation));
         }
         
         // Keep only the most recent sentences if the text gets too long
@@ -1339,8 +1339,8 @@ impl TranslationWindow {
             // Rebuild the display
             self.displayed_text = String::new();
             for (_, sentence) in &self.sentences {
-                self.displayed_text.push_str(&format!("[原文] {}\n", sentence.original));
-                self.displayed_text.push_str(&format!("[译文] {}\n\n", sentence.translation));
+                self.displayed_text.push_str(&format!("[Original] {}\n", sentence.original));
+                self.displayed_text.push_str(&format!("[Translation] {}\n\n", sentence.translation));
             }
         }
     }
