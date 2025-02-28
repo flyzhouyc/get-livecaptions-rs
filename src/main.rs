@@ -24,6 +24,7 @@ use tokio::task;
 use std::process::{Command, Stdio};
 use std::ffi::OsString;
 use std::os::windows::process::CommandExt;
+use std::collections::{HashMap, BTreeMap};
 
 /// Main module documentation
 /// 
@@ -963,24 +964,140 @@ impl Default for Config {
     }
 }
 
-/// 进程间通信的消息类型
+/// Sentence tracker for maintaining sentence-level synchronization
+struct SentenceTracker {
+    next_id: u64,
+    pending_sentences: HashMap<u64, PendingSentence>,
+    buffered_text: String,
+}
+
+struct PendingSentence {
+    original: String,
+    timestamp: u64,
+    sent_for_translation: bool,
+}
+
+impl SentenceTracker {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            pending_sentences: HashMap::new(),
+            buffered_text: String::new(),
+        }
+    }
+    
+    /// Add new text to the buffer and extract complete sentences
+    fn add_text(&mut self, text: &str) -> Vec<(u64, String)> {
+        self.buffered_text.push_str(text);
+        
+        // Extract complete sentences
+        let mut complete_sentences = Vec::new();
+        let mut sentence_start = 0;
+        let chars: Vec<char> = self.buffered_text.chars().collect();
+        
+        for i in 0..chars.len() {
+            if chars[i] == '.' || chars[i] == '!' || chars[i] == '?' || 
+               (chars[i] == '\n' && i > 0 && chars[i-1] != '.') {
+                // Found a sentence ending
+                if i > sentence_start {
+                    let sentence = self.buffered_text[sentence_start..=i].to_string();
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    
+                    // Store and prepare for sending
+                    self.pending_sentences.insert(id, PendingSentence {
+                        original: sentence.clone(),
+                        timestamp: Self::current_time_ms(),
+                        sent_for_translation: false,
+                    });
+                    
+                    complete_sentences.push((id, sentence));
+                    sentence_start = i + 1;
+                }
+            }
+        }
+        
+        // Update the buffer to contain only the incomplete sentence
+        if sentence_start > 0 && sentence_start < self.buffered_text.len() {
+            self.buffered_text = self.buffered_text[sentence_start..].to_string();
+        } else if sentence_start > 0 {
+            self.buffered_text.clear();
+        }
+        
+        complete_sentences
+    }
+    
+    /// Check if the current buffer should be sent even if incomplete
+    fn should_send_incomplete(&self) -> bool {
+        // Send incomplete sentences if they're long enough or have been buffering too long
+        self.buffered_text.len() > 100 || 
+        (!self.pending_sentences.is_empty() && 
+         Self::current_time_ms() - self.pending_sentences.values().map(|s| s.timestamp).max().unwrap_or(0) > 5000)
+    }
+    
+    /// Get the current incomplete sentence for sending
+    fn get_incomplete_sentence(&mut self) -> Option<(u64, String)> {
+        if self.buffered_text.is_empty() {
+            return None;
+        }
+        
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        // Store and prepare for sending
+        self.pending_sentences.insert(id, PendingSentence {
+            original: self.buffered_text.clone(),
+            timestamp: Self::current_time_ms(),
+            sent_for_translation: false,
+        });
+        
+        let result = (id, self.buffered_text.clone());
+        self.buffered_text.clear();
+        Some(result)
+    }
+    
+    /// Mark a sentence as sent for translation
+    fn mark_sent_for_translation(&mut self, id: u64) {
+        if let Some(sentence) = self.pending_sentences.get_mut(&id) {
+            sentence.sent_for_translation = true;
+        }
+    }
+    
+    /// Get current timestamp in milliseconds
+    fn current_time_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+}
+
+/// IPC messages for communication between processes
 #[derive(Debug, Serialize, Deserialize)]
 enum IpcMessage {
-    /// 发送给翻译窗口的配置消息
+    /// Configuration message
     Config(Config),
-    /// 发送给翻译窗口的文本消息
-    Text(String),
-    /// 关闭翻译窗口的消息
+    
+    /// Enhanced text message with metadata for better synchronization
+    Text {
+        id: u64,             // Unique identifier for this text segment
+        content: String,     // The text content to translate
+        timestamp: u64,      // Timestamp when the text was captured
+        is_complete: bool,   // Whether this is a complete sentence
+    },
+    
+    /// Shutdown message
     Shutdown,
 }
 
-/// Windows命名管道封装
+/// Windows named pipe wrapper
 struct NamedPipe {
     handle: HANDLE,
 }
 
 impl NamedPipe {
-    /// 创建一个新的命名管道服务器
+    /// Creates a new named pipe server
     fn create_server(pipe_name: &str) -> Result<Self, AppError> {
         let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
         
@@ -989,11 +1106,11 @@ impl NamedPipe {
                 &HSTRING::from(pipe_path),
                 windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x00000003), // PIPE_ACCESS_DUPLEX
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                1, // 最大实例数
-                4096, // 输出缓冲区大小
-                4096, // 输入缓冲区大小
-                0, // 默认超时
-                None, // 默认安全属性
+                1, // Max instances
+                4096, // Output buffer size
+                4096, // Input buffer size
+                0, // Default timeout
+                None, // Default security attributes
             )
         };
         
@@ -1004,7 +1121,7 @@ impl NamedPipe {
         Ok(Self { handle })
     }
     
-    /// 连接到现有的命名管道
+    /// Connects to an existing named pipe
     fn connect_client(pipe_name: &str) -> Result<Self, AppError> {
         let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
         
@@ -1023,12 +1140,12 @@ impl NamedPipe {
         Ok(Self { handle })
     }
     
-    /// 等待客户端连接到管道
+    /// Waits for a client to connect to the pipe
     fn wait_for_connection(&self) -> Result<(), AppError> {
         let result = unsafe { ConnectNamedPipe(self.handle, None) };
         if result.is_err() {
             let error = io::Error::last_os_error();
-            // ERROR_PIPE_CONNECTED表示客户端已经连接
+            // ERROR_PIPE_CONNECTED means client is already connected
             if error.raw_os_error() != Some(535) {
                 return Err(AppError::Io(error));
             }
@@ -1036,7 +1153,7 @@ impl NamedPipe {
         Ok(())
     }
     
-    /// 向管道写入消息
+    /// Writes a message to the pipe
     fn write_message(&self, message: &IpcMessage) -> Result<(), AppError> {
         let data = serde_json::to_vec(message)
             .map_err(|e| AppError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
@@ -1058,7 +1175,7 @@ impl NamedPipe {
         Ok(())
     }
     
-    /// 从管道读取消息
+    /// Reads a message from the pipe
     fn read_message(&self) -> Result<IpcMessage, AppError> {
         let mut buffer = vec![0u8; 4096];
         let mut bytes_read = 0;
@@ -1130,6 +1247,105 @@ struct Args {
     pipe_name: Option<String>,
 }
 
+/// Translation window for displaying translations
+struct TranslationWindow {
+    sentences: BTreeMap<u64, TranslatedSentence>,
+    displayed_text: String,
+}
+
+struct TranslatedSentence {
+    id: u64,
+    original: String,
+    translation: String,
+    timestamp: u64,
+    is_complete: bool,
+}
+
+impl TranslationWindow {
+    fn new() -> Self {
+        Self {
+            sentences: BTreeMap::new(),
+            displayed_text: String::new(),
+        }
+    }
+    
+    /// Process a new text message from the main process
+    async fn process_text_message(
+        &mut self, 
+        id: u64, 
+        content: String, 
+        timestamp: u64,
+        is_complete: bool,
+        translation_service: &Arc<dyn TranslationService>
+    ) -> Result<(), AppError> {
+        // Translate the text
+        match translation_service.translate(&content).await {
+            Ok(translated) => {
+                // Store the translated sentence
+                self.sentences.insert(id, TranslatedSentence {
+                    id,
+                    original: content,
+                    translation: translated,
+                    timestamp,
+                    is_complete,
+                });
+                
+                // Update the displayed text
+                self.update_display();
+                Ok(())
+            },
+            Err(e) => Err(e),
+        }
+    }
+    
+    /// Update the displayed text with the latest translations
+    fn update_display(&mut self) {
+        // Clear the current display
+        self.displayed_text.clear();
+        
+        // Add each sentence with proper formatting
+        for (_, sentence) in &self.sentences {
+            // Add original text with formatting
+            self.displayed_text.push_str(&format!("[原文] {}\n", sentence.original));
+            
+            // Add translation with formatting
+            self.displayed_text.push_str(&format!("[译文] {}\n\n", sentence.translation));
+        }
+        
+        // Keep only the most recent sentences if the text gets too long
+        self.maintain_display_length();
+        
+        // Display the updated text
+        display_translation_window(&self.displayed_text).unwrap_or_else(|e| {
+            warn!("Failed to update translation display: {}", e);
+        });
+    }
+    
+    /// Ensure the display doesn't get too long
+    fn maintain_display_length(&mut self) {
+        const MAX_SENTENCES: usize = 10;
+        
+        if self.sentences.len() > MAX_SENTENCES {
+            // Remove oldest sentences
+            let keys_to_remove: Vec<u64> = self.sentences.keys()
+                .take(self.sentences.len() - MAX_SENTENCES)
+                .cloned()
+                .collect();
+                
+            for key in keys_to_remove {
+                self.sentences.remove(&key);
+            }
+            
+            // Rebuild the display
+            self.displayed_text = String::new();
+            for (_, sentence) in &self.sentences {
+                self.displayed_text.push_str(&format!("[原文] {}\n", sentence.original));
+                self.displayed_text.push_str(&format!("[译文] {}\n\n", sentence.translation));
+            }
+        }
+    }
+}
+
 /// Main engine for the caption process
 struct Engine {
     config: Config,
@@ -1141,7 +1357,7 @@ struct Engine {
     output_file: Option<fs::File>, // Output file handle
     translation_process: Option<std::process::Child>, // Translation window process
     translation_pipe: Option<NamedPipe>, // Named pipe for IPC with translation window
-    text_buffer: String, // 文本缓冲区，用于累积文本直到形成完整句子
+    sentence_tracker: SentenceTracker, // Sentence tracker for translation
 }
 
 impl Engine {
@@ -1235,7 +1451,7 @@ impl Engine {
                 .arg("--pipe-name")
                 .arg(&pipe_name)
                 .stdin(Stdio::null())
-                // 调试时可保留标准输出和错误输出
+                // For debugging, keep stdout and stderr
                 //.stdout(Stdio::null())
                 //.stderr(Stdio::null())
                 .creation_flags(0x00000010) // CREATE_NEW_CONSOLE
@@ -1265,29 +1481,10 @@ impl Engine {
             config,
             translation_process,
             translation_pipe,
-            text_buffer: String::new(), // 初始化文本缓冲区
+            sentence_tracker: SentenceTracker::new(),
         })
     }
-    
-    /// 检查文本是否应该被发送进行翻译
-    /// 
-    /// 满足以下条件之一时返回true：
-    /// 1. 文本包含句子结束符（句号、问号、感叹号）
-    /// 2. 文本长度超过指定阈值
-    /// 3. 文本中包含段落分隔符（如逗号）且已累积足够长度
-    fn should_send_for_translation(&self) -> bool {
-        // 检查是否包含句子结束符
-        let has_sentence_end = self.text_buffer.contains(|c| c == '.' || c == '?' || c == '!');
-        
-        // 检查长度是否达到阈值
-        let exceeds_length_threshold = self.text_buffer.len() > 100;
-        
-        // 检查是否包含逗号且长度适中
-        let has_comma_with_length = self.text_buffer.contains(',') && self.text_buffer.len() > 50;
-        
-        has_sentence_end || exceeds_length_threshold || has_comma_with_length
-    }
-    
+
     /// Main loop for the engine
     /// 
     /// This function handles the main event loop, capturing, processing,
@@ -1350,40 +1547,65 @@ impl Engine {
                         Ok(Some(text)) => {
                             debug!("Captured new text: {}", text);
                             
-                            // 将新捕获的文本添加到缓冲区
-                            self.text_buffer.push_str(&text);
-                            
-                            // 附加文本到显示文本（仅原始文本，不包含翻译）
+                            // Add to displayed text (original text only)
                             self.displayed_text.push_str(&text);
+                            self.limit_text_length();
+                            Self::display_text(&self.displayed_text)?;
                             
-                            // 检查是否有完整句子可以发送进行翻译
-                            if self.should_send_for_translation() && !self.text_buffer.is_empty() {
-                                // 如果翻译窗口存在，发送完整句子进行翻译
-                                if let Some(pipe) = &self.translation_pipe {
-                                    debug!("Sending text for translation: {}", self.text_buffer);
-                                    if let Err(e) = pipe.write_message(&IpcMessage::Text(self.text_buffer.clone())) {
-                                        warn!("Failed to send text to translation window: {}", e);
+                            // Process for translation if translation is enabled
+                            if self.translation_pipe.is_some() && !text.is_empty() {
+                                // Extract complete sentences for translation
+                                let complete_sentences = self.sentence_tracker.add_text(&text);
+                                
+                                // Send complete sentences for translation
+                                for (id, sentence) in complete_sentences {
+                                    if let Some(pipe) = &self.translation_pipe {
+                                        debug!("Sending complete sentence for translation [{}]: {}", id, sentence);
+                                        let message = IpcMessage::Text {
+                                            id,
+                                            content: sentence,
+                                            timestamp: SentenceTracker::current_time_ms(),
+                                            is_complete: true,
+                                        };
+                                        
+                                        if let Err(e) = pipe.write_message(&message) {
+                                            warn!("Failed to send text to translation window: {}", e);
+                                        } else {
+                                            self.sentence_tracker.mark_sent_for_translation(id);
+                                        }
                                     }
-                                    // 翻译后清空缓冲区
-                                    self.text_buffer.clear();
+                                }
+                                
+                                // Check if we should send incomplete sentences
+                                if self.sentence_tracker.should_send_incomplete() {
+                                    if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
+                                        if let Some(pipe) = &self.translation_pipe {
+                                            debug!("Sending incomplete sentence for translation [{}]: {}", id, text);
+                                            let message = IpcMessage::Text {
+                                                id,
+                                                content: text,
+                                                timestamp: SentenceTracker::current_time_ms(),
+                                                is_complete: false,
+                                            };
+                                            
+                                            if let Err(e) = pipe.write_message(&message) {
+                                                warn!("Failed to send text to translation window: {}", e);
+                                            } else {
+                                                self.sentence_tracker.mark_sent_for_translation(id);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             
-                            // 限制文本长度
-                            self.limit_text_length();
-                            
-                            // 显示文本
-                            Self::display_text(&self.displayed_text)?;
-                            
-                            // 写入到输出文件（如果配置了）
+                            // Write to output file (if configured)
                             if let Some(file) = &mut self.output_file {
-                                // 如果需要同时写入原文和译文到文件，可以在这里处理
                                 if let Err(e) = writeln!(file, "{}", text) {
                                     warn!("Failed to write to output file: {}", e);
                                 }
                             }
                             
-                            // 重置连续空白计数和自适应间隔
+                            // Reset consecutive empty captures and adaptive interval
                             self.consecutive_empty_captures = 0;
                             self.adaptive_interval = self.config.min_interval;
                             capture_timer = tokio::time::interval(Duration::from_secs_f64(self.adaptive_interval));
@@ -1391,19 +1613,28 @@ impl Engine {
                         Ok(None) => {
                             info!("No new captions available");
                             
-                            // 检查是否应该发送当前缓冲区内容
-                            // 长时间没有新内容时也发送，以避免文本在缓冲区中滞留
-                            if !self.text_buffer.is_empty() && self.consecutive_empty_captures > 2 {
-                                if let Some(pipe) = &self.translation_pipe {
-                                    debug!("Sending accumulated text for translation due to inactivity: {}", self.text_buffer);
-                                    if let Err(e) = pipe.write_message(&IpcMessage::Text(self.text_buffer.clone())) {
-                                        warn!("Failed to send text to translation window: {}", e);
+                            // Check if we should send any buffered text due to inactivity
+                            if self.translation_pipe.is_some() && self.consecutive_empty_captures > 2 {
+                                if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
+                                    if let Some(pipe) = &self.translation_pipe {
+                                        debug!("Sending buffered text for translation due to inactivity [{}]: {}", id, text);
+                                        let message = IpcMessage::Text {
+                                            id,
+                                            content: text,
+                                            timestamp: SentenceTracker::current_time_ms(),
+                                            is_complete: false,
+                                        };
+                                        
+                                        if let Err(e) = pipe.write_message(&message) {
+                                            warn!("Failed to send text to translation window: {}", e);
+                                        } else {
+                                            self.sentence_tracker.mark_sent_for_translation(id);
+                                        }
                                     }
-                                    self.text_buffer.clear();
                                 }
                             }
                             
-                            // 逐渐增加间隔时间
+                            // Gradually increase the interval
                             self.consecutive_empty_captures += 1;
                             if self.consecutive_empty_captures > 5 {
                                 self.adaptive_interval = (self.adaptive_interval * 1.2).min(self.config.max_interval);
@@ -1492,14 +1723,20 @@ impl Engine {
     async fn graceful_shutdown(&mut self) -> Result<(), AppError> {
         info!("Performing graceful shutdown");
         
-        // 发送最后的缓冲区内容
-        if !self.text_buffer.is_empty() {
+        // Send any remaining buffered text for translation
+        if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
             if let Some(pipe) = &self.translation_pipe {
-                info!("Sending final buffered text for translation: {}", self.text_buffer);
-                if let Err(e) = pipe.write_message(&IpcMessage::Text(self.text_buffer.clone())) {
+                info!("Sending final buffered text for translation [{}]: {}", id, text);
+                let message = IpcMessage::Text {
+                    id,
+                    content: text,
+                    timestamp: SentenceTracker::current_time_ms(),
+                    is_complete: false,
+                };
+                
+                if let Err(e) = pipe.write_message(&message) {
                     warn!("Failed to send final buffered text to translation window: {}", e);
                 }
-                self.text_buffer.clear();
             }
         }
         
@@ -1508,7 +1745,14 @@ impl Engine {
             Ok(Some(text)) => {
                 // If translation window is active, send the final text
                 if let Some(pipe) = &self.translation_pipe {
-                    if let Err(e) = pipe.write_message(&IpcMessage::Text(text.clone())) {
+                    let id = self.sentence_tracker.next_id;
+                    let message = IpcMessage::Text {
+                        id,
+                        content: text.clone(),
+                        timestamp: SentenceTracker::current_time_ms(),
+                        is_complete: true,
+                    };
+                    if let Err(e) = pipe.write_message(&message) {
                         warn!("Failed to send final text to translation window: {}", e);
                     }
                 }
@@ -1557,39 +1801,39 @@ impl Engine {
     }
 }
 
-/// 专用于翻译窗口的显示方法
+/// Displays translation in a dedicated window
 fn display_translation_window(text: &str) -> Result<(), AppError> {
-    // 清屏并移动到左上角
+    // Clear screen and move to top-left corner
     print!("\x1B[2J\x1B[1;1H");
-    println!("翻译窗口");
+    println!("Translation Window");
     println!("----------------------------------------");
     println!("{}", text);
     io::stdout().flush()?;
     Ok(())
 }
 
-/// 运行翻译窗口进程
+/// Runs the translation window process
 /// 
-/// 此函数处理翻译窗口进程，该进程从主进程接收文本，
-/// 翻译它，并在单独的窗口中显示。
+/// This function handles the translation window process, which receives text from
+/// the main process, translates it, and displays it in a separate window.
 async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
-    info!("启动翻译窗口，管道: {}", pipe_name);
+    info!("Starting translation window, pipe: {}", pipe_name);
     
-    // 连接到命名管道
+    // Connect to the named pipe
     let pipe = NamedPipe::connect_client(&pipe_name)?;
-    info!("已连接到管道: {}", pipe_name);
+    info!("Connected to pipe: {}", pipe_name);
     
-    // 等待配置消息
+    // Wait for configuration message
     let config = match pipe.read_message()? {
         IpcMessage::Config(config) => config,
-        _ => return Err(AppError::Config("第一条消息应为Config消息".to_string())),
+        _ => return Err(AppError::Config("First message should be Config message".to_string())),
     };
     
-    info!("收到配置");
+    info!("Received configuration");
     
-    // 创建翻译服务
+    // Create translation service
     let translation_service = if let Some(api_key) = &config.translation_api_key {
-        // 确保目标语言已设置
+        // Ensure target language is set
         let target_lang = config.target_language.clone().unwrap_or_else(|| {
             match config.translation_api_type {
                 TranslationApiType::DeepL => "ZH".to_string(),
@@ -1598,7 +1842,7 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
             }
         });
         
-        info!("初始化翻译服务，使用 {:?} API", config.translation_api_type);
+        info!("Initializing translation service with {:?} API", config.translation_api_type);
         Some(create_translation_service(
             api_key.clone(),
             target_lang,
@@ -1608,7 +1852,7 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
             config.openai_system_prompt.clone()
         ))
     } else if config.translation_api_type == TranslationApiType::Demo {
-        // Demo模式不需要API密钥
+        // Demo mode doesn't need an API key
         let target_lang = config.target_language.clone().unwrap_or_else(|| "zh-CN".to_string());
         Some(create_translation_service(
             "".to_string(),
@@ -1619,93 +1863,75 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
             None
         ))
     } else {
-        warn!("翻译已启用但未提供API密钥");
+        warn!("Translation enabled but no API key provided");
         None
     };
     
     if translation_service.is_none() {
-        return Err(AppError::Translation("创建翻译服务失败".to_string()));
+        return Err(AppError::Translation("Failed to create translation service".to_string()));
     }
     
     let translation_service = translation_service.unwrap();
     
-    // 设置Ctrl+C处理器
+    // Set up Ctrl+C handler
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     
-    // 清屏并显示窗口标题
+    // Initialize translation window
+    let mut translation_window = TranslationWindow::new();
+    
+    // Clear screen and display window title
     print!("\x1B[2J\x1B[1;1H");
-    println!("翻译窗口");
-    println!("  - 翻译服务: {}", translation_service.get_name());
-    println!("  - 目标语言: {}", translation_service.get_target_language());
-    println!("按Ctrl+C退出");
+    println!("Translation Window");
+    println!("  - Translation service: {}", translation_service.get_name());
+    println!("  - Target language: {}", translation_service.get_target_language());
+    println!("Press Ctrl+C to exit");
     println!("----------------------------------------");
     io::stdout().flush()?;
     
-    // 用于显示的文本
-    let mut displayed_text = String::new();
-    
-    // 主循环
+    // Main loop
     loop {
         tokio::select! {
             _ = &mut ctrl_c => {
-                println!("\n收到关闭信号");
+                println!("\nReceived shutdown signal");
                 break;
             },
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // 检查新消息
+                // Check for new messages
                 match pipe.read_message() {
-                    Ok(IpcMessage::Text(text)) => {
-                        // 接收到完整句子，直接翻译
-                        debug!("收到文本进行翻译: {}", text);
-                        if !text.is_empty() {
-                            match translation_service.translate(&text).await {
-                                Ok(translated) => {
-                                    // 显示翻译文本
-                                    displayed_text.push_str(&translated);
-                                    displayed_text.push_str("\n");
-                                    
-                                    // 限制文本长度
-                                    if displayed_text.len() > config.max_text_length {
-                                        let lines: Vec<&str> = displayed_text.lines().collect();
-                                        if lines.len() > 20 {
-                                            displayed_text = lines[lines.len() - 20..].join("\n");
-                                            displayed_text.push_str("\n");
-                                        }
-                                    }
-                                    
-                                    // 显示翻译文本
-                                    display_translation_window(&displayed_text)?;
-                                },
-                                Err(e) => {
-                                    warn!("翻译失败: {}", e);
-                                }
+                    Ok(IpcMessage::Text { id, content, timestamp, is_complete }) => {
+                        debug!("Received text for translation [{}]: {}", id, content);
+                        if !content.is_empty() {
+                            if let Err(e) = translation_window.process_text_message(
+                                id, content, timestamp, is_complete, &translation_service
+                            ).await {
+                                warn!("Translation failed: {}", e);
                             }
                         }
                     },
                     Ok(IpcMessage::Shutdown) => {
-                        info!("收到关闭消息");
+                        info!("Received shutdown message");
                         break;
                     },
                     Ok(_) => {
-                        // 忽略其他消息类型
+                        // Ignore other message types
                     },
                     Err(e) => {
-                        // 检查错误是否由于管道关闭
+                        // Check if error is due to pipe being closed
                         if let AppError::Io(io_err) = &e {
                             if io_err.kind() == io::ErrorKind::BrokenPipe {
-                                info!("管道已关闭，正在关闭");
+                                info!("Pipe closed, shutting down");
                                 break;
                             }
                         }
-                        warn!("从管道读取时出错: {}", e);
+                        warn!("Error reading from pipe: {}", e);
                     }
                 }
             }
         }
     }
     
-    println!("\n翻译窗口正在关闭");
+    println!("\nTranslation window closing");
     Ok(())
 }
 
@@ -1833,5 +2059,28 @@ mod tests {
         invalid_config.min_interval = 5.0;
         invalid_config.max_interval = 3.0;
         assert!(invalid_config.validate().is_err());
+    }
+    
+    /// Tests for sentence tracker
+    #[test]
+    fn test_sentence_tracker() {
+        let mut tracker = SentenceTracker::new();
+        
+        // Test adding complete sentences
+        let sentences = tracker.add_text("Hello. This is a test.");
+        assert_eq!(sentences.len(), 2);
+        assert_eq!(sentences[0].1, "Hello.");
+        assert_eq!(sentences[1].1, " This is a test.");
+        
+        // Test incomplete sentence
+        let sentences = tracker.add_text("This is incomplete");
+        assert_eq!(sentences.len(), 0);
+        assert_eq!(tracker.buffered_text, "This is incomplete");
+        
+        // Test completing a sentence
+        let sentences = tracker.add_text(" and now complete.");
+        assert_eq!(sentences.len(), 1);
+        assert_eq!(sentences[0].1, "This is incomplete and now complete.");
+        assert_eq!(tracker.buffered_text, "");
     }
 }
