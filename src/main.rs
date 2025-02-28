@@ -8,7 +8,7 @@ use windows::{
     Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_MODE, FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, WriteFile, ReadFile},
     Win32::Security::*,
 };
-use windows::Win32::Storage::FileSystem::{GENERIC_READ, GENERIC_WRITE};
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use thiserror::Error;
@@ -1024,7 +1024,7 @@ impl NamedPipe {
         let handle = unsafe {
             CreateNamedPipeW(
                 &HSTRING::from(pipe_path),
-                0x00000003, // PIPE_ACCESS_DUPLEX
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x00000003), // PIPE_ACCESS_DUPLEX
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                 1, // Max instances
                 4096, // Out buffer size
@@ -1048,7 +1048,7 @@ impl NamedPipe {
         let handle = unsafe {
             CreateFileW(
                 &HSTRING::from(pipe_path),
-                GENERIC_READ | GENERIC_WRITE,
+                (GENERIC_READ | GENERIC_WRITE).0,
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
@@ -1063,7 +1063,7 @@ impl NamedPipe {
     /// Waits for a client to connect to the pipe
     fn wait_for_connection(&self) -> Result<(), AppError> {
         let result = unsafe { ConnectNamedPipe(self.handle, None) };
-        if !result.as_bool() {
+        if result.is_err() {
             let error = io::Error::last_os_error();
             // ERROR_PIPE_CONNECTED means a client has already connected
             if error.raw_os_error() != Some(535) {
@@ -1082,14 +1082,13 @@ impl NamedPipe {
         let success = unsafe {
             WriteFile(
                 self.handle,
-                data.as_ptr() as *const _,
-                data.len() as u32,
+                Some(&data),
                 Some(&mut bytes_written),
                 None,
             )
         };
         
-        if !success.as_bool() || bytes_written as usize != data.len() {
+        if success.is_err() || bytes_written as usize != data.len() {
             return Err(AppError::Io(io::Error::last_os_error()));
         }
         
@@ -1104,14 +1103,13 @@ impl NamedPipe {
         let success = unsafe {
             ReadFile(
                 self.handle,
-                buffer.as_mut_ptr() as *mut _,
-                buffer.len() as u32,
+                Some(&mut buffer),
                 Some(&mut bytes_read),
                 None,
             )
         };
         
-        if !success.as_bool() {
+        if success.is_err() {
             return Err(AppError::Io(io::Error::last_os_error()));
         }
         
