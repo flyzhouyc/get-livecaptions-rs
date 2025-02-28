@@ -1141,6 +1141,7 @@ struct Engine {
     output_file: Option<fs::File>, // Output file handle
     translation_process: Option<std::process::Child>, // Translation window process
     translation_pipe: Option<NamedPipe>, // Named pipe for IPC with translation window
+    text_buffer: String, // 文本缓冲区，用于累积文本直到形成完整句子
 }
 
 impl Engine {
@@ -1264,7 +1265,27 @@ impl Engine {
             config,
             translation_process,
             translation_pipe,
+            text_buffer: String::new(), // 初始化文本缓冲区
         })
+    }
+    
+    /// 检查文本是否应该被发送进行翻译
+    /// 
+    /// 满足以下条件之一时返回true：
+    /// 1. 文本包含句子结束符（句号、问号、感叹号）
+    /// 2. 文本长度超过指定阈值
+    /// 3. 文本中包含段落分隔符（如逗号）且已累积足够长度
+    fn should_send_for_translation(&self) -> bool {
+        // 检查是否包含句子结束符
+        let has_sentence_end = self.text_buffer.contains(|c| c == '.' || c == '?' || c == '!');
+        
+        // 检查长度是否达到阈值
+        let exceeds_length_threshold = self.text_buffer.len() > 100;
+        
+        // 检查是否包含逗号且长度适中
+        let has_comma_with_length = self.text_buffer.contains(',') && self.text_buffer.len() > 50;
+        
+        has_sentence_end || exceeds_length_threshold || has_comma_with_length
     }
     
     /// Main loop for the engine
@@ -1329,57 +1350,60 @@ impl Engine {
                         Ok(Some(text)) => {
                             debug!("Captured new text: {}", text);
                             
-                            // If translation window is active, send text to it
-                            if let Some(pipe) = &self.translation_pipe {
-                                if let Err(e) = pipe.write_message(&IpcMessage::Text(text.clone())) {
-                                    warn!("Failed to send text to translation window: {}", e);
+                            // 将新捕获的文本添加到缓冲区
+                            self.text_buffer.push_str(&text);
+                            
+                            // 附加文本到显示文本（仅原始文本，不包含翻译）
+                            self.displayed_text.push_str(&text);
+                            
+                            // 检查是否有完整句子可以发送进行翻译
+                            if self.should_send_for_translation() && !self.text_buffer.is_empty() {
+                                // 如果翻译窗口存在，发送完整句子进行翻译
+                                if let Some(pipe) = &self.translation_pipe {
+                                    debug!("Sending text for translation: {}", self.text_buffer);
+                                    if let Err(e) = pipe.write_message(&IpcMessage::Text(self.text_buffer.clone())) {
+                                        warn!("Failed to send text to translation window: {}", e);
+                                    }
+                                    // 翻译后清空缓冲区
+                                    self.text_buffer.clear();
                                 }
                             }
                             
-                            // Process text for display in main window
-                            let display_text = if self.translation_pipe.is_some() {
-                                // If separate translation window is used, only show original text
-                                text.clone()
-                            } else if let Some(service) = &self.translation_service {
-                                // Otherwise use inline translation if enabled
-                                match service.translate(&text).await {
-                                    Ok(translated) => {
-                                        debug!("Translated text: {} -> {}", text, translated);
-                                        format!("{} [{}]", text, translated)
-                                    },
-                                    Err(e) => {
-                                        warn!("Translation failed: {}", e);
-                                        text.clone()
-                                    }
-                                }
-                            } else {
-                                text.clone()
-                            };
-                            
-                            // Append processed text to displayed text
-                            self.displayed_text.push_str(&display_text);
-                            
-                            // Limit text length
+                            // 限制文本长度
                             self.limit_text_length();
                             
-                            // Display text
+                            // 显示文本
                             Self::display_text(&self.displayed_text)?;
                             
-                            // Write to output file if configured
+                            // 写入到输出文件（如果配置了）
                             if let Some(file) = &mut self.output_file {
-                                if let Err(e) = writeln!(file, "{}", display_text) {
+                                // 如果需要同时写入原文和译文到文件，可以在这里处理
+                                if let Err(e) = writeln!(file, "{}", text) {
                                     warn!("Failed to write to output file: {}", e);
                                 }
                             }
                             
-                            // Reset consecutive empty count and adaptive interval
+                            // 重置连续空白计数和自适应间隔
                             self.consecutive_empty_captures = 0;
                             self.adaptive_interval = self.config.min_interval;
                             capture_timer = tokio::time::interval(Duration::from_secs_f64(self.adaptive_interval));
                         },
                         Ok(None) => {
                             info!("No new captions available");
-                            // Gradually increase interval on consecutive empty captures
+                            
+                            // 检查是否应该发送当前缓冲区内容
+                            // 长时间没有新内容时也发送，以避免文本在缓冲区中滞留
+                            if !self.text_buffer.is_empty() && self.consecutive_empty_captures > 2 {
+                                if let Some(pipe) = &self.translation_pipe {
+                                    debug!("Sending accumulated text for translation due to inactivity: {}", self.text_buffer);
+                                    if let Err(e) = pipe.write_message(&IpcMessage::Text(self.text_buffer.clone())) {
+                                        warn!("Failed to send text to translation window: {}", e);
+                                    }
+                                    self.text_buffer.clear();
+                                }
+                            }
+                            
+                            // 逐渐增加间隔时间
                             self.consecutive_empty_captures += 1;
                             if self.consecutive_empty_captures > 5 {
                                 self.adaptive_interval = (self.adaptive_interval * 1.2).min(self.config.max_interval);
@@ -1468,6 +1492,17 @@ impl Engine {
     async fn graceful_shutdown(&mut self) -> Result<(), AppError> {
         info!("Performing graceful shutdown");
         
+        // 发送最后的缓冲区内容
+        if !self.text_buffer.is_empty() {
+            if let Some(pipe) = &self.translation_pipe {
+                info!("Sending final buffered text for translation: {}", self.text_buffer);
+                if let Err(e) = pipe.write_message(&IpcMessage::Text(self.text_buffer.clone())) {
+                    warn!("Failed to send final buffered text to translation window: {}", e);
+                }
+                self.text_buffer.clear();
+            }
+        }
+        
         // Try to get final captions
         match self.caption_handle.get_captions().await {
             Ok(Some(text)) => {
@@ -1478,27 +1513,13 @@ impl Engine {
                     }
                 }
                 
-                // Process text for display
-                let final_text = if self.translation_pipe.is_some() {
-                    // If separate translation window is used, only show original text
-                    text
-                } else if let Some(service) = &self.translation_service {
-                    // Otherwise use inline translation if enabled
-                    match service.translate(&text).await {
-                        Ok(translated) => format!("{} [{}]", text, translated),
-                        Err(_) => text,
-                    }
-                } else {
-                    text
-                };
-                
                 // Append to displayed text
-                self.displayed_text.push_str(&final_text);
+                self.displayed_text.push_str(&text);
                 
                 // Limit text length
                 self.limit_text_length();
                 
-                info!("Final captions captured: {}", final_text);
+                info!("Final captions captured: {}", text);
             },
             Ok(None) => {
                 info!("No new captions at shutdown");
@@ -1621,8 +1642,7 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
     println!("----------------------------------------");
     io::stdout().flush()?;
     
-    // 用于积累文本进行更好的翻译的缓冲区
-    let mut text_buffer = String::new();
+    // 用于显示的文本
     let mut displayed_text = String::new();
     
     // 主循环
@@ -1636,12 +1656,10 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
                 // 检查新消息
                 match pipe.read_message() {
                     Ok(IpcMessage::Text(text)) => {
-                        // 添加文本到缓冲区
-                        text_buffer.push_str(&text);
-                        
-                        // 检查是否有足够的文本进行翻译
-                        if !text_buffer.is_empty() {
-                            match translation_service.translate(&text_buffer).await {
+                        // 接收到完整句子，直接翻译
+                        debug!("收到文本进行翻译: {}", text);
+                        if !text.is_empty() {
+                            match translation_service.translate(&text).await {
                                 Ok(translated) => {
                                     // 显示翻译文本
                                     displayed_text.push_str(&translated);
@@ -1658,9 +1676,6 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
                                     
                                     // 显示翻译文本
                                     display_translation_window(&displayed_text)?;
-                                    
-                                    // 清除缓冲区
-                                    text_buffer.clear();
                                 },
                                 Err(e) => {
                                     warn!("翻译失败: {}", e);
