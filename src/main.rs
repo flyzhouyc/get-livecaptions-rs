@@ -2,13 +2,8 @@ use tokio::time::{Duration, Instant};
 use std::path::PathBuf;
 use std::sync::Arc;
 use windows::{
-    core::*, Win32::System::Com::*, Win32::UI::{Accessibility::*, WindowsAndMessaging::*}, 
-    Win32::Foundation::{HWND, HANDLE, CloseHandle},
-    Win32::System::Pipes::*,
-    Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_MODE, FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, WriteFile, ReadFile},
-    Win32::Security::*,
+    core::*, Win32::System::Com::*, Win32::UI::{Accessibility::*, WindowsAndMessaging::*}, Win32::Foundation::HWND,
 };
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use thiserror::Error;
@@ -21,9 +16,6 @@ use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
-use std::process::{Command, Stdio};
-use std::ffi::OsString;
-use std::os::windows::process::CommandExt;
 
 /// Main module documentation
 /// 
@@ -990,144 +982,6 @@ struct Args {
     /// Target language for translation
     #[arg(short = 'l', long)]
     target_language: Option<String>,
-    
-    /// Flag to indicate this is a translation window process
-    #[arg(long, hide = true)]
-    translation_window: bool,
-    
-    /// Named pipe name for inter-process communication
-    #[arg(long, hide = true)]
-    pipe_name: Option<String>,
-}
-
-/// Message types for inter-process communication
-#[derive(Debug, Serialize, Deserialize)]
-enum IpcMessage {
-    /// Configuration message sent to the translation window
-    Config(Config),
-    /// Text message sent to the translation window for translation
-    Text(String),
-    /// Shutdown message to close the translation window
-    Shutdown,
-}
-
-/// Named pipe wrapper for Windows
-struct NamedPipe {
-    handle: HANDLE,
-}
-
-impl NamedPipe {
-    /// Creates a new named pipe server
-    fn create_server(pipe_name: &str) -> Result<Self, AppError> {
-        let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
-        
-        let handle = unsafe {
-            CreateNamedPipeW(
-                &HSTRING::from(pipe_path),
-                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x00000003), // PIPE_ACCESS_DUPLEX
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                1, // Max instances
-                4096, // Out buffer size
-                4096, // In buffer size
-                0, // Default timeout
-                None, // Default security attributes
-            )
-        };
-        
-        if handle.is_invalid() {
-            return Err(AppError::Io(io::Error::last_os_error()));
-        }
-        
-        Ok(Self { handle })
-    }
-    
-    /// Connects to an existing named pipe
-    fn connect_client(pipe_name: &str) -> Result<Self, AppError> {
-        let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
-        
-        let handle = unsafe {
-            CreateFileW(
-                &HSTRING::from(pipe_path),
-                (GENERIC_READ | GENERIC_WRITE).0,
-                FILE_SHARE_NONE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                HANDLE(0),
-            )?
-        };
-        
-        Ok(Self { handle })
-    }
-    
-    /// Waits for a client to connect to the pipe
-    fn wait_for_connection(&self) -> Result<(), AppError> {
-        let result = unsafe { ConnectNamedPipe(self.handle, None) };
-        if result.is_err() {
-            let error = io::Error::last_os_error();
-            // ERROR_PIPE_CONNECTED means a client has already connected
-            if error.raw_os_error() != Some(535) {
-                return Err(AppError::Io(error));
-            }
-        }
-        Ok(())
-    }
-    
-    /// Writes a message to the pipe
-    fn write_message(&self, message: &IpcMessage) -> Result<(), AppError> {
-        let data = serde_json::to_vec(message)
-            .map_err(|e| AppError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        
-        let mut bytes_written = 0;
-        let success = unsafe {
-            WriteFile(
-                self.handle,
-                Some(&data),
-                Some(&mut bytes_written),
-                None,
-            )
-        };
-        
-        if success.is_err() || bytes_written as usize != data.len() {
-            return Err(AppError::Io(io::Error::last_os_error()));
-        }
-        
-        Ok(())
-    }
-    
-    /// Reads a message from the pipe
-    fn read_message(&self) -> Result<IpcMessage, AppError> {
-        let mut buffer = vec![0u8; 4096];
-        let mut bytes_read = 0;
-        
-        let success = unsafe {
-            ReadFile(
-                self.handle,
-                Some(&mut buffer),
-                Some(&mut bytes_read),
-                None,
-            )
-        };
-        
-        if success.is_err() {
-            return Err(AppError::Io(io::Error::last_os_error()));
-        }
-        
-        buffer.truncate(bytes_read as usize);
-        
-        let message = serde_json::from_slice(&buffer)
-            .map_err(|e| AppError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        
-        Ok(message)
-    }
-}
-
-impl Drop for NamedPipe {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.handle);
-        }
-    }
 }
 
 /// Main engine for the caption process
@@ -1139,8 +993,6 @@ struct Engine {
     consecutive_empty_captures: usize, // Count of consecutive empty captures
     adaptive_interval: f64, // Adaptive capture interval
     output_file: Option<fs::File>, // Output file handle
-    translation_process: Option<std::process::Child>, // Translation window process
-    translation_pipe: Option<NamedPipe>, // Named pipe for IPC with translation window
 }
 
 impl Engine {
@@ -1160,7 +1012,7 @@ impl Engine {
         // Create caption handle
         let caption_handle = CaptionHandle::new()?;
         
-        // Create translation service if enabled and we're not in a separate window
+        // Create translation service if enabled
         let translation_service = if config.enable_translation {
             if let Some(api_key) = &config.translation_api_key {
                 // Ensure target language is set
@@ -1214,45 +1066,6 @@ impl Engine {
             None
         };
         
-        // Create translation window if translation is enabled
-        let (translation_process, translation_pipe) = if config.enable_translation {
-            // Generate a unique pipe name
-            let pipe_name = format!("get-livecaptions-pipe-{}", std::process::id());
-            info!("Creating named pipe: {}", pipe_name);
-            
-            // Create named pipe server
-            let pipe = NamedPipe::create_server(&pipe_name)?;
-            
-            // Get current executable path
-            let exe_path = std::env::current_exe()
-                .map_err(|e| AppError::Io(e))?;
-            
-            // Launch translation window process
-            info!("Launching translation window process");
-            let process = Command::new(exe_path)
-                .arg("--translation-window")
-                .arg("--pipe-name")
-                .arg(&pipe_name)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(0x00000010) // CREATE_NEW_CONSOLE
-                .spawn()
-                .map_err(|e| AppError::Io(e))?;
-            
-            // Wait for client to connect
-            info!("Waiting for translation window to connect");
-            pipe.wait_for_connection()?;
-            info!("Translation window connected");
-            
-            // Send configuration to translation window
-            pipe.write_message(&IpcMessage::Config(config.clone()))?;
-            
-            (Some(process), Some(pipe))
-        } else {
-            (None, None)
-        };
-        
         Ok(Self {
             displayed_text: String::new(),
             caption_handle,
@@ -1261,8 +1074,6 @@ impl Engine {
             adaptive_interval: config.min_interval,
             output_file,
             config,
-            translation_process,
-            translation_pipe,
         })
     }
     
@@ -1324,16 +1135,24 @@ impl Engine {
                     match self.caption_handle.get_captions().await {
                         Ok(Some(text)) => {
                             debug!("Captured new text: {}", text);
-                            
-                            // If translation is enabled and we have a pipe, send text to translation window
-                            if let Some(pipe) = &self.translation_pipe {
-                                if let Err(e) = pipe.write_message(&IpcMessage::Text(text.clone())) {
-                                    warn!("Failed to send text to translation window: {}", e);
+                            // Process text (translate if enabled)
+                            let processed_text = if let Some(service) = &self.translation_service {
+                                match service.translate(&text).await {
+                                    Ok(translated) => {
+                                        debug!("Translated text: {} -> {}", text, translated);
+                                        format!("{} [{}]", text, translated)
+                                    },
+                                    Err(e) => {
+                                        warn!("Translation failed: {}", e);
+                                        text
+                                    }
                                 }
-                            }
+                            } else {
+                                text
+                            };
                             
-                            // Append text to displayed text (original text only)
-                            self.displayed_text.push_str(&text);
+                            // Append processed text to displayed text
+                            self.displayed_text.push_str(&processed_text);
                             
                             // Limit text length
                             self.limit_text_length();
@@ -1343,7 +1162,7 @@ impl Engine {
                             
                             // Write to output file if configured
                             if let Some(file) = &mut self.output_file {
-                                if let Err(e) = writeln!(file, "{}", text) {
+                                if let Err(e) = writeln!(file, "{}", processed_text) {
                                     warn!("Failed to write to output file: {}", e);
                                 }
                             }
@@ -1447,20 +1266,23 @@ impl Engine {
         // Try to get final captions
         match self.caption_handle.get_captions().await {
             Ok(Some(text)) => {
-                // If translation window is active, send the final text
-                if let Some(pipe) = &self.translation_pipe {
-                    if let Err(e) = pipe.write_message(&IpcMessage::Text(text.clone())) {
-                        warn!("Failed to send final text to translation window: {}", e);
+                // Process the final caption if possible
+                let final_text = if let Some(service) = &self.translation_service {
+                    match service.translate(&text).await {
+                        Ok(translated) => format!("{} [{}]", text, translated),
+                        Err(_) => text,
                     }
-                }
+                } else {
+                    text
+                };
                 
                 // Append to displayed text
-                self.displayed_text.push_str(&text);
+                self.displayed_text.push_str(&final_text);
                 
                 // Limit text length
                 self.limit_text_length();
                 
-                info!("Final captions captured: {}", text);
+                info!("Final captions captured: {}", final_text);
             },
             Ok(None) => {
                 info!("No new captions at shutdown");
@@ -1475,17 +1297,6 @@ impl Engine {
             println!("\n");
             print!("> {}", self.displayed_text);
             io::stdout().flush()?;
-        }
-        
-        // Shut down the translation window if it exists
-        if let Some(pipe) = &self.translation_pipe {
-            info!("Shutting down translation window");
-            if let Err(e) = pipe.write_message(&IpcMessage::Shutdown) {
-                warn!("Failed to send shutdown message to translation window: {}", e);
-            }
-            
-            // Give the translation window some time to shut down
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         
         // Shut down the caption handle
@@ -1546,181 +1357,16 @@ async fn create_engine() -> Result<Engine, AppError> {
     Engine::new(config).await
 }
 
-/// Runs the translation window process
-/// 
-/// This function handles the translation window process, which receives text from the main process,
-/// translates it, and displays it in a separate window.
-/// 
-/// # Arguments
-/// 
-/// * `pipe_name` - The name of the pipe to connect to
-/// 
-/// # Returns
-/// 
-/// * `Ok(())` - The translation window ran successfully until shutdown
-/// * `Err(AppError)` - An error occurred during the run
-async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
-    info!("Starting translation window with pipe: {}", pipe_name);
-    
-    // Connect to the named pipe
-    let pipe = NamedPipe::connect_client(&pipe_name)?;
-    info!("Connected to pipe: {}", pipe_name);
-    
-    // Wait for configuration message
-    let config = match pipe.read_message()? {
-        IpcMessage::Config(config) => config,
-        _ => return Err(AppError::Config("Expected Config message as first message".to_string())),
-    };
-    
-    info!("Received configuration");
-    
-    // Create translation service
-    let translation_service = if let Some(api_key) = &config.translation_api_key {
-        // Ensure target language is set
-        let target_lang = config.target_language.clone().unwrap_or_else(|| {
-            match config.translation_api_type {
-                TranslationApiType::DeepL => "ZH".to_string(), // DeepL uses uppercase language codes
-                TranslationApiType::OpenAI => "Chinese".to_string(), // OpenAI uses natural language descriptions
-                _ => "zh-CN".to_string(),
-            }
-        });
-        
-        info!("Initializing translation service with {:?} API", config.translation_api_type);
-        Some(create_translation_service(
-            api_key.clone(),
-            target_lang,
-            config.translation_api_type,
-            config.openai_api_url.clone(),
-            config.openai_model.clone(),
-            config.openai_system_prompt.clone()
-        ))
-    } else if config.translation_api_type == TranslationApiType::Demo {
-        // Demo mode doesn't need an API key
-        let target_lang = config.target_language.clone().unwrap_or_else(|| "zh-CN".to_string());
-        Some(create_translation_service(
-            "".to_string(),
-            target_lang,
-            TranslationApiType::Demo,
-            None,
-            None,
-            None
-        ))
-    } else {
-        warn!("Translation enabled but no API key provided");
-        None
-    };
-    
-    if translation_service.is_none() {
-        return Err(AppError::Translation("Failed to create translation service".to_string()));
-    }
-    
-    let translation_service = translation_service.unwrap();
-    
-    // Set up Ctrl+C handler
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    
-    println!("Translation window started:");
-    println!("  - Translation service: {}", translation_service.get_name());
-    println!("  - Target language: {}", translation_service.get_target_language());
-    println!("Press Ctrl+C to exit");
-    println!("-----------------------------------");
-    
-    // Buffer for accumulating text for better translation
-    let mut text_buffer = String::new();
-    let mut displayed_text = String::new();
-    
-    // Main loop
-    loop {
-        tokio::select! {
-            _ = &mut ctrl_c => {
-                println!("\nReceived shutdown signal");
-                break;
-            },
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // Check for new messages
-                match pipe.read_message() {
-                    Ok(IpcMessage::Text(text)) => {
-                        // Add text to buffer
-                        text_buffer.push_str(&text);
-                        
-                        // Check if we have enough text to translate
-                        // For simplicity, we'll translate immediately, but in a real implementation
-                        // you might want to wait for a complete sentence or paragraph
-                        if !text_buffer.is_empty() {
-                            match translation_service.translate(&text_buffer).await {
-                                Ok(translated) => {
-                                    // Display translated text
-                                    displayed_text.push_str(&translated);
-                                    
-                                    // Limit text length
-                                    if displayed_text.len() > config.max_text_length {
-                                        displayed_text = displayed_text.chars()
-                                            .skip(displayed_text.len() - config.max_text_length)
-                                            .collect();
-                                    }
-                                    
-                                    // Display text
-                                    Engine::display_text(&displayed_text)?;
-                                    
-                                    // Clear buffer
-                                    text_buffer.clear();
-                                },
-                                Err(e) => {
-                                    warn!("Translation failed: {}", e);
-                                }
-                            }
-                        }
-                    },
-                    Ok(IpcMessage::Shutdown) => {
-                        info!("Received shutdown message");
-                        break;
-                    },
-                    Ok(_) => {
-                        // Ignore other message types
-                    },
-                    Err(e) => {
-                        // Check if the error is due to the pipe being closed
-                        if let AppError::Io(io_err) = &e {
-                            if io_err.kind() == io::ErrorKind::BrokenPipe {
-                                info!("Pipe closed, shutting down");
-                                break;
-                            }
-                        }
-                        warn!("Error reading from pipe: {}", e);
-                    }
-                }
-            }
-        }
-    }
-    
-    println!("\nTranslation window shutting down");
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logger
     env_logger::init();
     
-    // Parse command line arguments
-    let args = Args::parse();
-    
-    // Check if this is a translation window process
-    if args.translation_window {
-        if let Some(pipe_name) = args.pipe_name {
-            // Run as translation window
-            return run_translation_window(pipe_name).await.map_err(|e| anyhow::anyhow!(e));
-        } else {
-            return Err(anyhow::anyhow!("Translation window requires pipe name"));
-        }
-    }
-    
     // Create engine
-    let mut engine = create_engine().await.map_err(|e| anyhow::anyhow!(e))?;
+    let mut engine = create_engine().await?;
     
     // Run the engine
-    engine.run().await.map_err(|e| anyhow::anyhow!(e))?;
+    engine.run().await?;
     
     Ok(())
 }
