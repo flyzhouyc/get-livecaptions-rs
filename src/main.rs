@@ -5,9 +5,10 @@ use windows::{
     core::*, Win32::System::Com::*, Win32::UI::{Accessibility::*, WindowsAndMessaging::*}, 
     Win32::Foundation::{HWND, HANDLE, CloseHandle},
     Win32::System::Pipes::*,
-    Win32::Storage::FileSystem::*,
+    Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_MODE, FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, WriteFile, ReadFile},
     Win32::Security::*,
 };
+use windows::Win32::Storage::FileSystem::{GENERIC_READ, GENERIC_WRITE};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use thiserror::Error;
@@ -1023,7 +1024,7 @@ impl NamedPipe {
         let handle = unsafe {
             CreateNamedPipeW(
                 &HSTRING::from(pipe_path),
-                PIPE_ACCESS_DUPLEX,
+                0x00000003, // PIPE_ACCESS_DUPLEX
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                 1, // Max instances
                 4096, // Out buffer size
@@ -1047,18 +1048,14 @@ impl NamedPipe {
         let handle = unsafe {
             CreateFileW(
                 &HSTRING::from(pipe_path),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL,
                 HANDLE(0),
-            )
+            )?
         };
-        
-        if handle.is_invalid() {
-            return Err(AppError::Io(io::Error::last_os_error()));
-        }
         
         Ok(Self { handle })
     }
@@ -1715,17 +1712,17 @@ async fn main() -> Result<()> {
     if args.translation_window {
         if let Some(pipe_name) = args.pipe_name {
             // Run as translation window
-            return run_translation_window(pipe_name).await;
+            return run_translation_window(pipe_name).await.map_err(|e| anyhow::anyhow!(e));
         } else {
-            return Err(anyhow::anyhow!("Translation window requires pipe name").into());
+            return Err(anyhow::anyhow!("Translation window requires pipe name"));
         }
     }
     
     // Create engine
-    let mut engine = create_engine().await?;
+    let mut engine = create_engine().await.map_err(|e| anyhow::anyhow!(e))?;
     
     // Run the engine
-    engine.run().await?;
+    engine.run().await.map_err(|e| anyhow::anyhow!(e))?;
     
     Ok(())
 }
