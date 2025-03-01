@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
 use std::collections::{HashMap, BTreeMap};
+use std::collections::VecDeque;
 
 /// Main module documentation
 /// 
@@ -1453,8 +1454,8 @@ fn default_active_interval_ms() -> u64 { 50 }  // 50ms polling when active (very
 fn default_idle_interval_ms() -> u64 { 500 }   // 500ms polling when idle
 fn default_active_timeout_sec() -> f64 { 5.0 } // 5 seconds after last caption
 fn default_translation_cache_size() -> usize { 1000 } // Cache 1000 translations
-fn default_translation_batch_size() -> usize { 5 }   // Translate 5 texts at a time
-fn default_translation_batch_delay_ms() -> u64 { 500 } // Wait 500ms max for batch accumulation
+fn default_translation_batch_size() -> usize { 3 }   // Reduced from 5 to 3
+fn default_translation_batch_delay_ms() -> u64 { 300 } // Reduced from 500ms to 300ms
 
 impl Config {
     /// Loads configuration from a file, creating a default if it doesn't exist
@@ -1632,6 +1633,7 @@ struct SentenceTracker {
     batch_size: usize,
     batch_timeout_ms: u64,
     last_batch_time: u64,
+    last_text_time: u64,
 }
 
 struct PendingSentence {
@@ -1649,22 +1651,43 @@ impl SentenceTracker {
             batch_size,
             batch_timeout_ms,
             last_batch_time: Self::current_time_ms(),
+            last_text_time: Self::current_time_ms(),
         }
     }
     
     /// Add new text to the buffer and extract complete sentences
     fn add_text(&mut self, text: &str) -> Vec<(u64, String)> {
+        if !text.is_empty() {
+            self.last_text_time = Self::current_time_ms();
+        }
         self.buffered_text.push_str(text);
         
-        // Extract complete sentences
+        // Extract complete sentences with improved detection
         let mut complete_sentences = Vec::new();
         let mut sentence_start = 0;
         let chars: Vec<char> = self.buffered_text.chars().collect();
         
+        // Track potential sentence endings for more nuanced detection
+        let mut last_pause = 0;
+        
         for i in 0..chars.len() {
-            if chars[i] == '.' || chars[i] == '!' || chars[i] == '?' || 
-               (chars[i] == '\n' && i > 0 && chars[i-1] != '.') {
-                // Found a sentence ending
+            // Standard sentence endings
+            let is_sentence_end = chars[i] == '.' || chars[i] == '!' || chars[i] == '?' || 
+                                 chars[i] == ';' || // Add semicolon as a sentence boundary
+                                 (chars[i] == '\n' && i > 0 && chars[i-1] != '.');
+            
+            // Detect pauses that might indicate phrase boundaries (comma followed by space)
+            let is_pause = chars[i] == ',' && i + 1 < chars.len() && chars[i+1] == ' ';
+            if is_pause {
+                last_pause = i;
+            }
+            
+            // Detect long phrases without punctuation
+            let is_long_phrase = i - sentence_start > 80 && chars[i] == ' ' && 
+                                (last_pause == 0 || i - last_pause > 40);
+            
+            if is_sentence_end || is_long_phrase {
+                // Found a sentence or long phrase ending
                 if i > sentence_start {
                     let sentence = self.buffered_text[sentence_start..=i].to_string();
                     let id = self.next_id;
@@ -1679,6 +1702,9 @@ impl SentenceTracker {
                     
                     complete_sentences.push((id, sentence));
                     sentence_start = i + 1;
+                    
+                    // Reset pause tracking for new sentence
+                    last_pause = 0;
                 }
             }
         }
@@ -1695,10 +1721,18 @@ impl SentenceTracker {
     
     /// Check if the current buffer should be sent even if incomplete
     fn should_send_incomplete(&self) -> bool {
-        // Send incomplete sentences if they're long enough or have been buffering too long
-        self.buffered_text.len() > 100 || 
+        // More aggressive criteria for sending incomplete sentences
+        // - Length threshold lowered from 100 to 30 characters
+        // - Time threshold lowered from 5000ms to 2000ms
+        // - Also send if we detect a likely pause in speech (silence for a period)
+        
+        self.buffered_text.len() > 30 || 
         (!self.pending_sentences.is_empty() && 
-         Self::current_time_ms() - self.pending_sentences.values().map(|s| s.timestamp).max().unwrap_or(0) > 5000)
+         Self::current_time_ms() - self.pending_sentences.values()
+             .map(|s| s.timestamp).max().unwrap_or(0) > 2000) ||
+        // New condition: send buffered text if it's been accumulating for too long
+        (!self.buffered_text.is_empty() && 
+         Self::current_time_ms() - self.last_text_time > 1500)
     }
     
     /// Get the current incomplete sentence for sending
@@ -2023,13 +2057,18 @@ impl TranslationWindow {
         // Clear the current display
         self.displayed_text.clear();
         
-        // Add each sentence with proper formatting
+        // Add each sentence with improved formatting and timestamps
         for (_, sentence) in &self.sentences {
+            // Format timestamp for display
+            let time = chrono::Local.timestamp_millis_opt(sentence.timestamp as i64)
+                .unwrap_or_else(|| chrono::Local::now())
+                .format("%H:%M:%S").to_string();
+            
             // Add original text with formatting
-            self.displayed_text.push_str(&format!("[Original] {}\n", sentence.original));
+            self.displayed_text.push_str(&format!("[{}] [Original] {}\n", time, sentence.original));
             
             // Add translation with formatting
-            self.displayed_text.push_str(&format!("[Translation] {}\n\n", sentence.translation));
+            self.displayed_text.push_str(&format!("[{}] [Translation] {}\n\n", time, sentence.translation));
         }
         
         // Keep only the most recent sentences if the text gets too long
@@ -2043,7 +2082,7 @@ impl TranslationWindow {
     
     /// Ensure the display doesn't get too long
     fn maintain_display_length(&mut self) {
-        const MAX_SENTENCES: usize = 10;
+        const MAX_SENTENCES: usize = 25; // Increased from 10 to 25
         
         if self.sentences.len() > MAX_SENTENCES {
             // Remove oldest sentences
@@ -2781,41 +2820,33 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
                           requests, batches, cache_hits, hit_rate * 100.0);
                 }
             },
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // Check for new messages
-                match pipe.read_message() {
-                    Ok(IpcMessage::Text { id, content, timestamp, is_complete }) => {
-                        debug!("Received text for translation [{}]: {}", id, content);
-                        if !content.is_empty() {
-                            if let Err(e) = translation_window.process_text_message(
-                                id, content, timestamp, is_complete, &translation_processor
-                            ).await {
-                                warn!("Translation failed: {}", e);
-                            }
-                        }
-                    },
-                    Ok(IpcMessage::Shutdown) => {
-                        info!("Received shutdown message");
+            _ = tokio::time::sleep(Duration::from_millis(750)) => {
+                // Force process any pending batches that haven't met the normal criteria
+                if self.translation_pipe.is_some() && !self.sentence_tracker.get_pending_batch().is_empty() {
+                    let batch = self.sentence_tracker.get_pending_batch();
+                    if !batch.is_empty() {
+                        let batch_ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
                         
-                        // Display final translation stats
-                        let (requests, batches, cache_hits, _, hit_rate) = translation_processor.get_stats().await;
-                        info!("Final translation stats: {} requests, {} batches, {} cache hits, {:.1}% hit rate",
-                              requests, batches, cache_hits, hit_rate * 100.0);
+                        debug!("Periodic flush: sending batch of {} sentences for translation", batch.len());
                         
-                        break;
-                    },
-                    Ok(_) => {
-                        // Ignore other message types
-                    },
-                    Err(e) => {
-                        // Check if error is due to pipe being closed
-                        if let AppError::Io(io_err) = &e {
-                            if io_err.kind() == io::ErrorKind::BrokenPipe {
-                                info!("Pipe closed, shutting down");
-                                break;
+                        // Send batch to translation window
+                        if let Some(pipe) = &self.translation_pipe {
+                            for (id, content) in batch {
+                                let message = IpcMessage::Text {
+                                    id,
+                                    content,
+                                    timestamp: SentenceTracker::current_time_ms(),
+                                    is_complete: true,
+                                };
+                                
+                                if let Err(e) = pipe.write_message(&message) {
+                                    warn!("Failed to send batch text to translation window: {}", e);
+                                }
                             }
+                            
+                            // Mark batch as sent
+                            self.sentence_tracker.mark_batch_sent_for_translation(&batch_ids);
                         }
-                        warn!("Error reading from pipe: {}", e);
                     }
                 }
             }
