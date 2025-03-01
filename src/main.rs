@@ -760,28 +760,30 @@ impl BatchTranslationProcessor {
             return Ok(());
         }
         
-        // Collect texts to translate
+        // Collect unique texts to translate
         let mut texts_to_translate = Vec::new();
-        let mut senders = HashMap::new();
+        let mut text_to_senders = HashMap::new();
         
         // Check cache first
         {
             let mut cache_guard = cache.lock().await;
             
-            for (text, text_senders) in current_queue.iter_mut() {
-                if let Some(cached_translation) = cache_guard.get(text) {
+            for (text, mut senders) in current_queue.drain() {
+                if let Some(cached_translation) = cache_guard.get(&text) {
                     // Cache hit, respond immediately
-                    for sender in text_senders.drain(..) {
+                    for sender in senders {
                         let _ = sender.send(Ok(cached_translation.clone()));
                     }
                     
                     // Update stats
                     let mut stats_guard = stats.lock().await;
-                    stats_guard.cache_hits += text_senders.len();
-                } else if !text_senders.is_empty() {
+                    stats_guard.cache_hits += senders.len();
+                } else if !senders.is_empty() {
                     // Cache miss, add to translation batch
-                    texts_to_translate.push(text.clone());
-                    senders.insert(text.clone(), text_senders.clone());
+                    if !text_to_senders.contains_key(&text) {
+                        texts_to_translate.push(text.clone());
+                    }
+                    text_to_senders.insert(text, senders);
                 }
             }
         }
@@ -800,28 +802,26 @@ impl BatchTranslationProcessor {
             let translations = service.translate_batch(&texts_to_translate).await?;
             
             // Cache results and respond to senders
-            {
-                let mut cache_guard = cache.lock().await;
-                
-                for (i, text) in texts_to_translate.iter().enumerate() {
-                    if i < translations.len() {
-                        let translation = translations[i].clone();
-                        
-                        // Cache the result
-                        cache_guard.put(text.clone(), translation.clone());
-                        
-                        // Respond to all senders for this text
-                        if let Some(text_senders) = senders.get(text) {
-                            for sender in text_senders {
-                                let _ = sender.send(Ok(translation.clone()));
-                            }
+            let mut cache_guard = cache.lock().await;
+            
+            for (i, text) in texts_to_translate.iter().enumerate() {
+                if i < translations.len() {
+                    let translation = translations[i].clone();
+                    
+                    // Cache the result
+                    cache_guard.put(text.clone(), translation.clone());
+                    
+                    // Respond to all senders for this text
+                    if let Some(senders) = text_to_senders.remove(text) {
+                        for sender in senders {
+                            let _ = sender.send(Ok(translation.clone()));
                         }
-                    } else {
-                        // This shouldn't happen, but handle it anyway
-                        if let Some(text_senders) = senders.get(text) {
-                            for sender in text_senders {
-                                let _ = sender.send(Err(AppError::Translation("Batch translation returned fewer results than expected".to_string())));
-                            }
+                    }
+                } else {
+                    // This shouldn't happen, but handle it anyway
+                    if let Some(senders) = text_to_senders.remove(text) {
+                        for sender in senders {
+                            let _ = sender.send(Err(AppError::Translation("Batch translation returned fewer results than expected".to_string())));
                         }
                     }
                 }
@@ -2106,6 +2106,10 @@ impl Engine {
         // Create caption handle
         let caption_handle = CaptionHandle::new()?;
         
+        let min_interval = config.min_interval;
+        let batch_size = config.translation_batch_size;
+        let batch_delay_ms = config.translation_batch_delay_ms;
+        
         // Create translation processor if enabled
         let translation_processor = if config.enable_translation {
             if let Some(api_key) = &config.translation_api_key {
@@ -2211,14 +2215,14 @@ impl Engine {
             caption_handle,
             translation_processor,
             consecutive_empty_captures: 0,
-            adaptive_interval: config.min_interval,
+            adaptive_interval: min_interval,  // Use stored value instead of config.min_interval
             output_file,
-            config,
+            config: config.clone(),  // Clone config before moving it
             translation_process,
             translation_pipe,
             sentence_tracker: SentenceTracker::new(
-                config.translation_batch_size,
-                config.translation_batch_delay_ms
+                batch_size,         // Use stored value instead of config.translation_batch_size
+                batch_delay_ms      // Use stored value instead of config.translation_batch_delay_ms
             ),
         })
     }
