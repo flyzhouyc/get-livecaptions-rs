@@ -2063,10 +2063,12 @@ impl TranslationWindow {
         
         // Add each sentence with improved formatting and timestamps
         for (_, sentence) in &self.sentences {
-            // Format timestamp for display
-            let time = Local.timestamp_millis_opt(sentence.timestamp as i64)
-                .unwrap_or(Local::now())
-                .format("%H:%M:%S").to_string();
+            // Format timestamp for display//
+            let time = match Local.timestamp_millis_opt(sentence.timestamp as i64) {
+                chrono::LocalResult::Single(dt) => dt,
+                _ => Local::now()
+            }
+            .format("%H:%M:%S").to_string();
             
             // Add original text with formatting
             self.displayed_text.push_str(&format!("[{}] [Original] {}\n", time, sentence.original));
@@ -2103,9 +2105,11 @@ impl TranslationWindow {
             self.displayed_text = String::new();
             for (_, sentence) in &self.sentences {
                 // Format timestamp for display
-                let time = Local.timestamp_millis_opt(sentence.timestamp as i64)
-                    .unwrap_or(Local::now())
-                    .format("%H:%M:%S").to_string();
+                let time = match Local.timestamp_millis_opt(sentence.timestamp as i64) {
+                    chrono::LocalResult::Single(dt) => dt,
+                    _ => Local::now()
+                }
+                .format("%H:%M:%S").to_string();
                 
                 self.displayed_text.push_str(&format!("[{}] [Original] {}\n", time, sentence.original));
                 self.displayed_text.push_str(&format!("[{}] [Translation] {}\n\n", time, sentence.translation));
