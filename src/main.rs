@@ -86,43 +86,6 @@ impl From<windows::core::Error> for AppError {
     }
 }
 
-/// Handler for UI Automation events
-#[windows::core::implement(windows::Win32::UI::Accessibility::IUIAutomationEventHandler)]
-pub struct CaptionEventHandler {
-    sender: mpsc::Sender<String>,
-}
-
-impl CaptionEventHandler {
-    fn new(sender: mpsc::Sender<String>) -> Self {
-        Self { sender }
-    }
-}
-
-impl windows::core::RuntimeName for CaptionEventHandler {}
-
-impl IUIAutomationEventHandler_Impl for CaptionEventHandler {
-    fn HandleAutomationEvent(&self, element: &core::option::Option<IUIAutomationElement>, event_id: i32) -> core::result::Result<(), core::Error> {
-        // Only process TextChanged events
-        if event_id == UIA_TextEdit_TextChangedEventId.0 {
-            if let Some(element) = element {
-                unsafe {
-                    if let Ok(name) = element.CurrentName() {
-                        // Send the caption text to the processor through the channel
-                        let text = name.to_string();
-                        if !text.is_empty() {
-                            // Using blocking_send as this callback happens on a COM thread
-                            if let Err(e) = self.sender.blocking_send(text) {
-                                eprintln!("Failed to send caption event: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Windows Live Captions handler that operates on a dedicated thread
 struct WindowsLiveCaptions {
     previous_text: String,
@@ -131,20 +94,13 @@ struct WindowsLiveCaptions {
     max_retries: usize,
     automation: IUIAutomation,
     condition: IUIAutomationCondition,
-    event_handler: Option<CaptionEventHandler>,
-    caption_receiver: mpsc::Receiver<String>,
-    event_registered: bool,
-    handler_interface: Option<IUIAutomationEventHandler>,
+    // Activity tracking for ultra-responsive mode
+    last_activity: Instant,
+    active_mode: bool,
 }
 
 impl Drop for WindowsLiveCaptions {
     fn drop(&mut self) {
-        // Unregister events before releasing COM resources
-        if self.event_registered {
-            if let Err(e) = self.unregister_events() {
-                warn!("Failed to unregister events on drop: {}", e);
-            }
-        }
         unsafe { CoUninitialize(); }
         info!("COM resources released");
     }
@@ -175,9 +131,6 @@ impl WindowsLiveCaptions {
         // Create a cache with a reasonable capacity
         let cache_capacity = NonZeroUsize::new(10).unwrap();
         
-        // Create a channel for event notifications
-        let (sender, receiver) = mpsc::channel(100);
-        
         Ok(Self {
             automation,
             condition,
@@ -185,96 +138,9 @@ impl WindowsLiveCaptions {
             element_cache: LruCache::new(cache_capacity),
             last_window_handle: HWND(0),
             max_retries: 3,
-            event_handler: Some(CaptionEventHandler::new(sender)),
-            caption_receiver: receiver,
-            event_registered: false,
-            handler_interface: None,
+            last_activity: Instant::now(),
+            active_mode: false,
         })
-    }
-
-    /// Registers for UI Automation text change events
-    fn register_events(&mut self) -> Result<(), AppError> {
-        if self.event_registered {
-            return Ok(()); // Already registered
-        }
-        
-        // Find the Live Captions window
-        let window = unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None) };
-        if window.0 == 0 {
-            return Err(AppError::UiAutomation("Live Captions window not found".to_string()));
-        }
-        
-        // Get window element
-        let window_element = unsafe { self.automation.ElementFromHandle(window) }?;
-        
-        // Find captions text element
-        let text_element = unsafe { 
-            window_element.FindFirst(TreeScope_Descendants, &self.condition)
-        }?;
-        
-        // Create event handler if it doesn't exist
-        if self.event_handler.is_none() {
-            // This shouldn't happen, but just in case
-            let (sender, new_receiver) = mpsc::channel(100);
-            self.event_handler = Some(CaptionEventHandler::new(sender));
-            self.caption_receiver = new_receiver;
-        }
-        
-        // Get the event handler interface
-        let handler = self.event_handler.as_ref().unwrap();
-        
-        // Create the handler interface that Windows UI Automation needs
-        let handler_interface: IUIAutomationEventHandler = handler.into();
-        self.handler_interface = Some(handler_interface.clone());
-        
-        // Register for text changed events
-        unsafe {
-            self.automation.AddAutomationEventHandler(
-                UIA_TextEdit_TextChangedEventId,
-                &text_element,
-                TreeScope_Element,
-                None,
-                self.handler_interface.as_ref().unwrap(),
-            )?;
-        }
-        
-        // Store references for cleanup
-        self.last_window_handle = window;
-        self.element_cache.clear(); // Clear the old cache
-        
-        let window_key = CacheKey::WindowElement(window.0);
-        let text_key = CacheKey::TextElement(window.0);
-        
-        self.element_cache.put(window_key, window_element);
-        self.element_cache.put(text_key, text_element);
-        
-        self.event_registered = true;
-        info!("Registered for caption events");
-        
-        Ok(())
-    }
-    
-    /// Unregisters UI Automation events
-    fn unregister_events(&mut self) -> Result<(), AppError> {
-        if !self.event_registered || self.handler_interface.is_none() {
-            return Ok(());
-        }
-        
-        if let Some(text_element) = self.element_cache.get(&CacheKey::TextElement(self.last_window_handle.0)) {
-            unsafe {
-                self.automation.RemoveAutomationEventHandler(
-                    UIA_TextEdit_TextChangedEventId,
-                    text_element,
-                    self.handler_interface.as_ref().unwrap(),
-                )?;
-            }
-        }
-        
-        self.event_registered = false;
-        self.handler_interface = None;
-        info!("Unregistered caption events");
-        
-        Ok(())
     }
 
     /// Extracts new text from the current text using diff detection
@@ -320,43 +186,6 @@ impl WindowsLiveCaptions {
         // Try to get an attribute to check if the element is still valid
         unsafe { 
             element.CurrentProcessId().is_ok()
-        }
-    }
-
-    /// Gets new captions using the event system
-    fn get_event_based_captions(&mut self) -> Result<Option<String>, AppError> {
-        // Check if events are registered, if not, register them
-        if !self.event_registered {
-            self.register_events()?;
-        }
-        
-        // Try to get captions from the channel
-        match self.caption_receiver.try_recv() {
-            Ok(text) => {
-                // Extract new content using diff detection
-                let new_text = self.extract_new_text(&text);
-                
-                // Update previous text
-                self.previous_text = text;
-                
-                if !new_text.is_empty() {
-                    Ok(Some(new_text))
-                } else {
-                    Ok(None)
-                }
-            },
-            Err(mpsc::error::TryRecvError::Empty) => {
-                // No new captions
-                Ok(None)
-            },
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                // Channel is disconnected, try to re-register
-                warn!("Caption event channel disconnected, re-registering");
-                self.event_registered = false;
-                self.handler_interface = None;
-                self.register_events()?;
-                Ok(None)
-            }
         }
     }
 
@@ -443,6 +272,12 @@ impl WindowsLiveCaptions {
         // Update previous text
         self.previous_text = current_text;
         
+        // If we have new content, update activity state
+        if !new_text.is_empty() {
+            self.last_activity = Instant::now();
+            self.active_mode = true;
+        }
+        
         if !new_text.is_empty() {
             Ok(Some(new_text))
         } else {
@@ -462,40 +297,42 @@ impl WindowsLiveCaptions {
     /// * `Ok(None)` - No new captions were found
     /// * `Err(AppError)` - All retry attempts failed
     fn get_livecaptions_with_retry(&mut self, max_retries: usize) -> Result<Option<String>, AppError> {
-        // First try to get captions using event-based approach
-        match self.get_event_based_captions() {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                // If event-based approach fails, fall back to polling
-                warn!("Event-based caption retrieval failed: {}, falling back to polling", e);
-                let mut attempts = 0;
-                let mut last_error = None;
-                
-                while attempts < max_retries {
-                    match self.get_livecaptions() {
-                        Ok(result) => return Ok(result),
-                        Err(e) => {
-                            attempts += 1;
-                            warn!("Attempt {}/{} failed: {}", attempts, max_retries, e);
-                            last_error = Some(e);
-                            if attempts < max_retries {
-                                // Exponential backoff - note we're not using async sleep here
-                                let backoff_ms = 100 * 2u64.pow(attempts as u32);
-                                debug!("Retrying in {} ms", backoff_ms);
-                                std::thread::sleep(Duration::from_millis(backoff_ms));
-                            }
-                        }
+        let mut attempts = 0;
+        let mut last_error = None;
+        
+        while attempts < max_retries {
+            match self.get_livecaptions() {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    attempts += 1;
+                    warn!("Attempt {}/{} failed: {}", attempts, max_retries, e);
+                    last_error = Some(e);
+                    if attempts < max_retries {
+                        // Exponential backoff - note we're not using async sleep here
+                        let backoff_ms = 100 * 2u64.pow(attempts as u32);
+                        debug!("Retrying in {} ms", backoff_ms);
+                        std::thread::sleep(Duration::from_millis(backoff_ms));
                     }
                 }
-                
-                Err(last_error.unwrap_or_else(|| AppError::UiAutomation("Unknown error after retries".to_string())))
             }
         }
+        
+        Err(last_error.unwrap_or_else(|| AppError::UiAutomation("Unknown error after retries".to_string())))
     }
     
     /// Checks if Live Captions is running
     fn is_available(&self) -> bool {
         unsafe { FindWindowW(w!("LiveCaptionsDesktopWindow"), None).0 != 0 }
+    }
+    
+    /// Checks if we're in active caption mode
+    fn is_active(&self, timeout_sec: f64) -> bool {
+        if !self.active_mode {
+            return false;
+        }
+        
+        // Check if we've seen activity within the timeout period
+        self.last_activity.elapsed().as_secs_f64() < timeout_sec
     }
 }
 
@@ -503,7 +340,7 @@ impl WindowsLiveCaptions {
 enum CaptionCommand {
     GetCaption(oneshot::Sender<Result<Option<String>, AppError>>),
     CheckAvailability(oneshot::Sender<bool>),
-    RegisterEvents(oneshot::Sender<Result<(), AppError>>),
+    IsActive(oneshot::Sender<bool>, f64),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -516,11 +353,6 @@ struct CaptionActor {
 impl CaptionActor {
     /// Main loop for the caption actor
     fn run(&mut self) {
-        // Try to register for events immediately
-        if let Err(e) = self.captions.register_events() {
-            warn!("Failed to register for caption events at startup: {}", e);
-        }
-        
         while let Some(cmd) = self.receiver.blocking_recv() {
             match cmd {
                 CaptionCommand::GetCaption(sender) => {
@@ -531,16 +363,12 @@ impl CaptionActor {
                     let available = self.captions.is_available();
                     let _ = sender.send(available);
                 },
-                CaptionCommand::RegisterEvents(sender) => {
-                    let result = self.captions.register_events();
-                    let _ = sender.send(result);
+                CaptionCommand::IsActive(sender, timeout) => {
+                    let active = self.captions.is_active(timeout);
+                    let _ = sender.send(active);
                 },
                 CaptionCommand::Shutdown(sender) => {
                     debug!("Caption actor shutting down");
-                    // Explicit unregister of events before shutdown
-                    if let Err(e) = self.captions.unregister_events() {
-                        warn!("Failed to unregister events during shutdown: {}", e);
-                    }
                     let _ = sender.send(());
                     break;
                 }
@@ -621,15 +449,24 @@ impl CaptionHandle {
             .map_err(|_| AppError::Task("Caption actor didn't respond".to_string()))
     }
     
-    /// Registers for caption events
-    async fn register_events(&self) -> Result<(), AppError> {
+    /// Checks if captions are active (recently seen)
+    /// 
+    /// # Arguments
+    /// 
+    /// * `timeout_sec` - How long after last caption to consider still active
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(bool)` - Whether captions are active
+    /// * `Err(AppError)` - An error occurred
+    async fn is_active(&self, timeout_sec: f64) -> Result<bool, AppError> {
         let (sender, receiver) = oneshot::channel();
-        self.sender.send(CaptionCommand::RegisterEvents(sender))
+        self.sender.send(CaptionCommand::IsActive(sender, timeout_sec))
             .await
             .map_err(|_| AppError::Task("Caption actor is no longer running".to_string()))?;
         
         receiver.await
-            .map_err(|_| AppError::Task("Caption actor didn't respond".to_string()))?
+            .map_err(|_| AppError::Task("Caption actor didn't respond".to_string()))
     }
     
     /// Shuts down the caption actor
@@ -1031,9 +868,18 @@ struct Config {
     openai_model: Option<String>,       // Model name
     openai_system_prompt: Option<String>, // System prompt
     
-    // Event-based settings
-    #[serde(default = "default_use_events")]
-    use_events: bool, // Whether to use event-based caption capture
+    // Ultra-responsive mode settings (new additions)
+    #[serde(default = "default_ultra_responsive")]
+    ultra_responsive: bool,       // Whether to use ultra-responsive mode
+    
+    #[serde(default = "default_active_interval_ms")]
+    active_interval_ms: u64,      // Polling interval when captions are active (milliseconds)
+    
+    #[serde(default = "default_idle_interval_ms")]
+    idle_interval_ms: u64,        // Polling interval when captions are idle (milliseconds)
+    
+    #[serde(default = "default_active_timeout_sec")]
+    active_timeout_sec: f64,      // How long to stay in active mode (seconds)
 }
 
 // Default value functions for serde
@@ -1042,7 +888,10 @@ fn default_check_interval() -> u64 { 10 }
 fn default_min_interval() -> f64 { 0.5 }
 fn default_max_interval() -> f64 { 3.0 }
 fn default_max_text_length() -> usize { 10000 }
-fn default_use_events() -> bool { true }
+fn default_ultra_responsive() -> bool { true }
+fn default_active_interval_ms() -> u64 { 50 }  // 50ms polling when active (very responsive)
+fn default_idle_interval_ms() -> u64 { 500 }   // 500ms polling when idle
+fn default_active_timeout_sec() -> f64 { 5.0 } // 5 seconds after last caption
 
 impl Config {
     /// Loads configuration from a file, creating a default if it doesn't exist
@@ -1152,6 +1001,21 @@ impl Config {
             }
         }
         
+        // Validate ultra-responsive mode settings
+        if self.ultra_responsive {
+            if self.active_interval_ms == 0 {
+                return Err(AppError::Validation("Active interval cannot be zero".to_string()));
+            }
+            
+            if self.idle_interval_ms == 0 {
+                return Err(AppError::Validation("Idle interval cannot be zero".to_string()));
+            }
+            
+            if self.active_timeout_sec <= 0.0 {
+                return Err(AppError::Validation("Active timeout must be positive".to_string()));
+            }
+        }
+        
         Ok(())
     }
 }
@@ -1172,7 +1036,10 @@ impl Default for Config {
             openai_api_url: None,
             openai_model: None,
             openai_system_prompt: None,
-            use_events: default_use_events(),
+            ultra_responsive: default_ultra_responsive(),
+            active_interval_ms: default_active_interval_ms(),
+            idle_interval_ms: default_idle_interval_ms(),
+            active_timeout_sec: default_active_timeout_sec(),
         }
     }
 }
@@ -1451,9 +1318,9 @@ struct Args {
     #[arg(short = 'l', long)]
     target_language: Option<String>,
     
-    /// Whether to use event-based caption capture
-    #[arg(short = 'e', long)]
-    use_events: Option<bool>,
+    /// Whether to use ultra-responsive mode
+    #[arg(short = 'u', long)]
+    ultra_responsive: Option<bool>,
     
     /// Flag to indicate this is a translation window process
     #[arg(long, hide = true)]
@@ -1594,12 +1461,6 @@ impl Engine {
         // Create caption handle
         let caption_handle = CaptionHandle::new()?;
         
-        // Register for caption events if enabled
-        if config.use_events {
-            info!("Registering for caption events");
-            caption_handle.register_events().await?;
-        }
-        
         // Create translation service if enabled
         let translation_service = if config.enable_translation {
             if let Some(api_key) = &config.translation_api_key {
@@ -1723,42 +1584,28 @@ impl Engine {
         // Initialize checking timer
         let mut check_timer = tokio::time::interval(Duration::from_secs(self.config.check_interval));
         
-        // Set up caption polling timer if not using events
-        let mut caption_timer = if !self.config.use_events {
-            Some(tokio::time::interval(Duration::from_secs_f64(self.config.capture_interval)))
-        } else {
-            None
-        };
-        
         // Set up Ctrl+C handler
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
         
-        // Create a channel for immediate caption checking
-        let (caption_tx, mut caption_rx) = mpsc::channel::<()>(1);
-        
-        // Create a task for continuous caption checking in event-based mode
-        let _caption_task = if self.config.use_events {
-            let tx = caption_tx.clone();
-            Some(tokio::spawn(async move {
-                loop {
-                    // Check for captions
-                    if let Err(_) = tx.send(()).await {
-                        break; // Channel closed, exit
-                    }
-                    // Brief sleep to avoid tight loop
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }))
+        // Initialize caption timer with appropriate interval
+        let mut current_interval_ms = if self.config.ultra_responsive {
+            self.config.active_interval_ms
         } else {
-            None
+            (self.config.capture_interval * 1000.0) as u64
         };
         
+        let mut caption_timer = tokio::time::interval(Duration::from_millis(current_interval_ms));
+        
+        // Print startup info
         println!("Live captions monitoring started:");
-        if self.config.use_events {
-            println!("  - Using event-based caption capture");
+        if self.config.ultra_responsive {
+            println!("  - Using ultra-responsive mode");
+            println!("    - Active polling: {}ms", self.config.active_interval_ms);
+            println!("    - Idle polling: {}ms", self.config.idle_interval_ms);
+            println!("    - Active timeout: {}s", self.config.active_timeout_sec);
         } else {
-            println!("  - Using polling-based caption capture with {} second interval", self.config.capture_interval);
+            println!("  - Using standard polling with {} second interval", self.config.capture_interval);
         }
         println!("  - Check interval: {} seconds", self.config.check_interval);
         if self.config.enable_translation {
@@ -1794,12 +1641,131 @@ impl Engine {
                         }
                     }
                 },
-                _ = async { if let Some(ref mut timer) = caption_timer { timer.tick().await } else { std::future::pending().await } }, if !self.config.use_events => {
-                    self.process_captions(&mut caption_timer).await?;
-                },
-                _ = caption_rx.recv() => {
-                    if self.config.use_events {
-                        self.process_captions(&mut caption_timer).await?;
+                _ = caption_timer.tick() => {
+                    // Process captions
+                    match self.caption_handle.get_captions().await {
+                        Ok(Some(text)) => {
+                            debug!("Captured new text: {}", text);
+                            
+                            // Add to displayed text (original text only)
+                            self.displayed_text.push_str(&text);
+                            self.limit_text_length();
+                            Self::display_text(&self.displayed_text)?;
+                            
+                            // Process for translation if translation is enabled
+                            if self.translation_pipe.is_some() && !text.is_empty() {
+                                // Extract complete sentences for translation
+                                let complete_sentences = self.sentence_tracker.add_text(&text);
+                                
+                                // Send complete sentences for translation
+                                for (id, sentence) in complete_sentences {
+                                    if let Some(pipe) = &self.translation_pipe {
+                                        debug!("Sending complete sentence for translation [{}]: {}", id, sentence);
+                                        let message = IpcMessage::Text {
+                                            id,
+                                            content: sentence,
+                                            timestamp: SentenceTracker::current_time_ms(),
+                                            is_complete: true,
+                                        };
+                                        
+                                        if let Err(e) = pipe.write_message(&message) {
+                                            warn!("Failed to send text to translation window: {}", e);
+                                        } else {
+                                            self.sentence_tracker.mark_sent_for_translation(id);
+                                        }
+                                    }
+                                }
+                                
+                                // Check if we should send incomplete sentences
+                                if self.sentence_tracker.should_send_incomplete() {
+                                    if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
+                                        if let Some(pipe) = &self.translation_pipe {
+                                            debug!("Sending incomplete sentence for translation [{}]: {}", id, text);
+                                            let message = IpcMessage::Text {
+                                                id,
+                                                content: text,
+                                                timestamp: SentenceTracker::current_time_ms(),
+                                                is_complete: false,
+                                            };
+                                            
+                                            if let Err(e) = pipe.write_message(&message) {
+                                                warn!("Failed to send text to translation window: {}", e);
+                                            } else {
+                                                self.sentence_tracker.mark_sent_for_translation(id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Write to output file (if configured)
+                            if let Some(file) = &mut self.output_file {
+                                if let Err(e) = writeln!(file, "{}", text) {
+                                    warn!("Failed to write to output file: {}", e);
+                                }
+                            }
+                            
+                            // In ultra-responsive mode, switch to fast polling on activity
+                            if self.config.ultra_responsive && current_interval_ms != self.config.active_interval_ms {
+                                current_interval_ms = self.config.active_interval_ms;
+                                caption_timer = tokio::time::interval(Duration::from_millis(current_interval_ms));
+                                debug!("Switched to active polling interval: {}ms", current_interval_ms);
+                            }
+                            
+                            // Reset consecutive empty captures counter
+                            self.consecutive_empty_captures = 0;
+                        },
+                        Ok(None) => {
+                            debug!("No new captions available");
+                            
+                            // In ultra-responsive mode, check if we should switch to idle polling
+                            if self.config.ultra_responsive {
+                                match self.caption_handle.is_active(self.config.active_timeout_sec).await {
+                                    Ok(active) => {
+                                        let target_interval_ms = if active {
+                                            self.config.active_interval_ms
+                                        } else {
+                                            self.config.idle_interval_ms
+                                        };
+                                        
+                                        // Only update if interval significantly different
+                                        if current_interval_ms != target_interval_ms {
+                                            current_interval_ms = target_interval_ms;
+                                            caption_timer = tokio::time::interval(Duration::from_millis(current_interval_ms));
+                                            debug!("Adjusted polling interval to {}ms", current_interval_ms);
+                                        }
+                                    },
+                                    Err(e) => warn!("Failed to check caption activity: {}", e)
+                                }
+                            }
+                            
+                            // Check if we should send any buffered text due to inactivity
+                            if self.translation_pipe.is_some() && self.consecutive_empty_captures > 2 {
+                                if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
+                                    if let Some(pipe) = &self.translation_pipe {
+                                        debug!("Sending buffered text for translation due to inactivity [{}]: {}", id, text);
+                                        let message = IpcMessage::Text {
+                                            id,
+                                            content: text,
+                                            timestamp: SentenceTracker::current_time_ms(),
+                                            is_complete: false,
+                                        };
+                                        
+                                        if let Err(e) = pipe.write_message(&message) {
+                                            warn!("Failed to send text to translation window: {}", e);
+                                        } else {
+                                            self.sentence_tracker.mark_sent_for_translation(id);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Track consecutive empty captures
+                            self.consecutive_empty_captures += 1;
+                        },
+                        Err(e) => {
+                            warn!("Failed to capture captions: {}", e);
+                        }
                     }
                 },
                 _ = &mut ctrl_c => {
@@ -1810,125 +1776,6 @@ impl Engine {
                 }
             };
         }
-    }
-    
-    /// Processes captured captions
-    async fn process_captions(&mut self, caption_timer: &mut Option<tokio::time::Interval>) -> Result<(), AppError> {
-        info!("Checking for new captions");
-        match self.caption_handle.get_captions().await {
-            Ok(Some(text)) => {
-                debug!("Captured new text: {}", text);
-                
-                // Add to displayed text (original text only)
-                self.displayed_text.push_str(&text);
-                self.limit_text_length();
-                Self::display_text(&self.displayed_text)?;
-                
-                // Process for translation if translation is enabled
-                if self.translation_pipe.is_some() && !text.is_empty() {
-                    // Extract complete sentences for translation
-                    let complete_sentences = self.sentence_tracker.add_text(&text);
-                    
-                    // Send complete sentences for translation
-                    for (id, sentence) in complete_sentences {
-                        if let Some(pipe) = &self.translation_pipe {
-                            debug!("Sending complete sentence for translation [{}]: {}", id, sentence);
-                            let message = IpcMessage::Text {
-                                id,
-                                content: sentence,
-                                timestamp: SentenceTracker::current_time_ms(),
-                                is_complete: true,
-                            };
-                            
-                            if let Err(e) = pipe.write_message(&message) {
-                                warn!("Failed to send text to translation window: {}", e);
-                            } else {
-                                self.sentence_tracker.mark_sent_for_translation(id);
-                            }
-                        }
-                    }
-                    
-                    // Check if we should send incomplete sentences
-                    if self.sentence_tracker.should_send_incomplete() {
-                        if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
-                            if let Some(pipe) = &self.translation_pipe {
-                                debug!("Sending incomplete sentence for translation [{}]: {}", id, text);
-                                let message = IpcMessage::Text {
-                                    id,
-                                    content: text,
-                                    timestamp: SentenceTracker::current_time_ms(),
-                                    is_complete: false,
-                                };
-                                
-                                if let Err(e) = pipe.write_message(&message) {
-                                    warn!("Failed to send text to translation window: {}", e);
-                                } else {
-                                    self.sentence_tracker.mark_sent_for_translation(id);
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // Write to output file (if configured)
-                if let Some(file) = &mut self.output_file {
-                    if let Err(e) = writeln!(file, "{}", text) {
-                        warn!("Failed to write to output file: {}", e);
-                    }
-                }
-                
-                // Reset consecutive empty captures and adaptive interval
-                self.consecutive_empty_captures = 0;
-                self.adaptive_interval = self.config.min_interval;
-                if !self.config.use_events {
-                    // Only adjust timer in polling mode
-                    if let Some(ref mut timer) = caption_timer {
-                        *timer = tokio::time::interval(Duration::from_secs_f64(self.adaptive_interval));
-                    }
-                }
-            },
-            Ok(None) => {
-                debug!("No new captions available");
-                
-                // Check if we should send any buffered text due to inactivity
-                if self.translation_pipe.is_some() && self.consecutive_empty_captures > 2 {
-                    if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
-                        if let Some(pipe) = &self.translation_pipe {
-                            debug!("Sending buffered text for translation due to inactivity [{}]: {}", id, text);
-                            let message = IpcMessage::Text {
-                                id,
-                                content: text,
-                                timestamp: SentenceTracker::current_time_ms(),
-                                is_complete: false,
-                            };
-                            
-                            if let Err(e) = pipe.write_message(&message) {
-                                warn!("Failed to send text to translation window: {}", e);
-                            } else {
-                                self.sentence_tracker.mark_sent_for_translation(id);
-                            }
-                        }
-                    }
-                }
-                
-                // Gradually increase the interval in polling mode
-                if !self.config.use_events {
-                    self.consecutive_empty_captures += 1;
-                    if self.consecutive_empty_captures > 5 {
-                        self.adaptive_interval = (self.adaptive_interval * 1.2).min(self.config.max_interval);
-                        info!("Adjusting capture interval to {} seconds", self.adaptive_interval);
-                        if let Some(ref mut timer) = caption_timer {
-                            *timer = tokio::time::interval(Duration::from_secs_f64(self.adaptive_interval));
-                        }
-                    }
-                }
-            },
-            Err(e) => {
-                warn!("Failed to capture captions: {}", e);
-            }
-        }
-        
-        Ok(())
     }
     
     /// Limits text length to prevent excessive memory use
@@ -2246,8 +2093,8 @@ async fn create_engine() -> Result<Engine, AppError> {
 	if let Some(lang) = args.target_language {
         config.target_language = Some(lang);
     }
-    if let Some(use_events) = args.use_events {
-        config.use_events = use_events;
+    if let Some(ultra) = args.ultra_responsive {
+        config.ultra_responsive = ultra;
     }
     
     // Validate the configuration
@@ -2303,10 +2150,8 @@ mod tests {
             element_cache: LruCache::new(NonZeroUsize::new(1).unwrap()),
             last_window_handle: HWND(0),
             max_retries: 1,
-            event_handler: None,
-            caption_receiver: mpsc::channel(1).1,
-            event_registered: false,
-            handler_interface: None,
+            last_activity: Instant::now(),
+            active_mode: false,
         };
         
         // Simple append test
@@ -2332,7 +2177,10 @@ mod tests {
             openai_api_url: None,
             openai_model: None,
             openai_system_prompt: None,
-            use_events: true,
+            ultra_responsive: true,
+            active_interval_ms: 50,
+            idle_interval_ms: 500,
+            active_timeout_sec: 5.0,
         };
         assert!(config.validate().is_ok());
         
