@@ -24,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
 use std::collections::{HashMap, BTreeMap};
 use std::collections::VecDeque;
+use chrono::{Local, TimeZone};
 
 /// Main module documentation
 /// 
@@ -1642,6 +1643,25 @@ struct PendingSentence {
     sent_for_translation: bool,
 }
 
+/// Sentence tracker for maintaining sentence-level synchronization with batching support
+struct SentenceTracker {
+    next_id: u64,
+    pending_sentences: HashMap<u64, PendingSentence>,
+    buffered_text: String,
+    // New fields to support batching
+    batch_size: usize,
+    batch_timeout_ms: u64,
+    last_batch_time: u64,
+    // New field to track when text was last added
+    last_text_time: u64,
+}
+
+struct PendingSentence {
+    original: String,
+    timestamp: u64,
+    sent_for_translation: bool,
+}
+
 impl SentenceTracker {
     fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
         Self {
@@ -1660,6 +1680,7 @@ impl SentenceTracker {
         if !text.is_empty() {
             self.last_text_time = Self::current_time_ms();
         }
+        
         self.buffered_text.push_str(text);
         
         // Extract complete sentences with improved detection
@@ -2060,8 +2081,8 @@ impl TranslationWindow {
         // Add each sentence with improved formatting and timestamps
         for (_, sentence) in &self.sentences {
             // Format timestamp for display
-            let time = chrono::Local.timestamp_millis_opt(sentence.timestamp as i64)
-                .unwrap_or_else(|| chrono::Local::now())
+            let time = Local.timestamp_millis_opt(sentence.timestamp as i64)
+                .unwrap_or_else(|| Local::now())
                 .format("%H:%M:%S").to_string();
             
             // Add original text with formatting
@@ -2098,8 +2119,13 @@ impl TranslationWindow {
             // Rebuild the display
             self.displayed_text = String::new();
             for (_, sentence) in &self.sentences {
-                self.displayed_text.push_str(&format!("[Original] {}\n", sentence.original));
-                self.displayed_text.push_str(&format!("[Translation] {}\n\n", sentence.translation));
+                // Format timestamp for display
+                let time = Local.timestamp_millis_opt(sentence.timestamp as i64)
+                    .unwrap_or_else(|| Local::now())
+                    .format("%H:%M:%S").to_string();
+                
+                self.displayed_text.push_str(&format!("[{}] [Original] {}\n", time, sentence.original));
+                self.displayed_text.push_str(&format!("[{}] [Translation] {}\n\n", time, sentence.translation));
             }
         }
     }
@@ -2114,6 +2140,16 @@ impl TranslationWindow {
         self.pending_translations.keys().cloned().collect()
     }
 }
+/// Displays translation in a dedicated window
+fn display_translation_window(text: &str) -> Result<(), AppError> {
+    // Clear screen and move to top-left corner
+    print!("\x1B[2J\x1B[1;1H");
+    println!("Translation Window (with Batch Processing and Caching)");
+    println!("----------------------------------------");
+    println!("{}", text);
+    io::stdout().flush()?;
+    Ok(())
+}
 
 /// Main engine for the caption process
 struct Engine {
@@ -2127,6 +2163,9 @@ struct Engine {
     translation_process: Option<std::process::Child>, // Translation window process
     translation_pipe: Option<NamedPipe>, // Named pipe for IPC with translation window
     sentence_tracker: SentenceTracker, // Sentence tracker for translation
+    // New fields for improved message handling
+    message_queue: VecDeque<IpcMessage>,
+    message_retry_count: HashMap<u64, usize>,
 }
 
 impl Engine {
@@ -2255,18 +2294,87 @@ impl Engine {
             caption_handle,
             translation_processor,
             consecutive_empty_captures: 0,
-            adaptive_interval: min_interval,  // Use stored value instead of config.min_interval
+            adaptive_interval: min_interval,
             output_file,
-            config: config.clone(),  // Clone config before moving it
+            config: config.clone(),
             translation_process,
             translation_pipe,
             sentence_tracker: SentenceTracker::new(
-                batch_size,         // Use stored value instead of config.translation_batch_size
-                batch_delay_ms      // Use stored value instead of config.translation_batch_delay_ms
+                batch_size,
+                batch_delay_ms
             ),
+            // Initialize new message queue fields
+            message_queue: VecDeque::new(),
+            message_retry_count: HashMap::new(),
         })
     }
-
+    // Improved message handling with retry mechanism
+    fn send_message_with_retry(pipe: &NamedPipe, message: &IpcMessage, max_retries: usize) -> Result<(), AppError> {
+        let mut attempt = 0;
+        loop {
+            match pipe.write_message(message) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        return Err(e);
+                    }
+                    warn!("Failed to send message, attempt {}/{}: {}", attempt, max_retries, e);
+                    // Exponential backoff
+                    std::thread::sleep(std::time::Duration::from_millis(50 * 2u64.pow(attempt as u32)));
+                }
+            }
+        }
+    }
+    // Add a method to process the message queue
+    fn process_message_queue(&mut self) -> Result<(), AppError> {
+        if self.message_queue.is_empty() || self.translation_pipe.is_none() {
+            return Ok(());
+        }
+        
+        let mut retries_needed = Vec::new();
+        
+        while let Some(message) = self.message_queue.pop_front() {
+            if let IpcMessage::Text { id, .. } = &message {
+                let pipe = self.translation_pipe.as_ref().unwrap();
+                match Self::send_message_with_retry(pipe, &message, 1) { // Try once now
+                    Ok(_) => {
+                        // Message sent successfully, remove from retry counts
+                        self.message_retry_count.remove(id);
+                    },
+                    Err(e) => {
+                        // Increment retry count
+                        let retry_count = self.message_retry_count.entry(*id).or_insert(0);
+                        *retry_count += 1;
+                        
+                        // If we haven't exceeded max retries, queue for retry
+                        if *retry_count < 5 {
+                            retries_needed.push(message);
+                            warn!("Message {} queued for retry ({}/5): {}", id, *retry_count, e);
+                        } else {
+                            warn!("Giving up on message {} after 5 retries", id);
+                            self.message_retry_count.remove(id);
+                        }
+                    }
+                }
+            }
+        }
+        // Re-queue messages that need retry
+        for message in retries_needed {
+            self.message_queue.push_back(message);
+        }
+        Ok(())
+    }
+    fn queue_translation_message(&mut self, message: IpcMessage) {
+        if let IpcMessage::Text { id, .. } = &message {
+            // Add to the queue
+            self.message_queue.push_back(message);
+            
+            // Initialize retry count
+            self.message_retry_count.entry(*id).or_insert(0);
+        }
+    }    
+    
     /// Main loop for the engine
     /// 
     /// This function handles the main event loop, capturing, processing,
@@ -2294,6 +2402,10 @@ impl Engine {
         };
         
         let mut caption_timer = tokio::time::interval(Duration::from_millis(current_interval_ms));
+        
+        // Initialize periodic timers for batch processing and message queue
+        let mut batch_timer = tokio::time::interval(Duration::from_millis(750));
+        let mut queue_timer = tokio::time::interval(Duration::from_millis(250));
         
         // Print startup info
         println!("Live captions monitoring started:");
@@ -2367,7 +2479,7 @@ impl Engine {
                             // Process for translation if translation is enabled
                             if self.translation_pipe.is_some() && !text.is_empty() {
                                 // Extract complete sentences for translation
-                                let _complete_sentences = self.sentence_tracker.add_text(&text);
+                                let complete_sentences = self.sentence_tracker.add_text(&text);
                                 
                                 // Check if we should send a batch
                                 if self.sentence_tracker.should_send_batch() {
@@ -2377,7 +2489,7 @@ impl Engine {
                                         
                                         debug!("Sending batch of {} sentences for translation", batch.len());
                                         
-                                        // Send batch to translation window
+                                        // Send batch to translation window using the improved message queue
                                         if let Some(pipe) = &self.translation_pipe {
                                             for (id, content) in batch {
                                                 let message = IpcMessage::Text {
@@ -2387,9 +2499,8 @@ impl Engine {
                                                     is_complete: true,
                                                 };
                                                 
-                                                if let Err(e) = pipe.write_message(&message) {
-                                                    warn!("Failed to send batch text to translation window: {}", e);
-                                                }
+                                                // Use new queue method instead of direct send
+                                                self.queue_translation_message(message);
                                             }
                                             
                                             // Mark batch as sent
@@ -2401,7 +2512,7 @@ impl Engine {
                                 // Check if we should send incomplete sentences
                                 if self.sentence_tracker.should_send_incomplete() {
                                     if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
-                                        if let Some(pipe) = &self.translation_pipe {
+                                        if let Some(_pipe) = &self.translation_pipe {
                                             debug!("Sending incomplete sentence for translation [{}]: {}", id, text);
                                             let message = IpcMessage::Text {
                                                 id,
@@ -2413,6 +2524,7 @@ impl Engine {
                                             if let Err(e) = pipe.write_message(&message) {
                                                 warn!("Failed to send text to translation window: {}", e);
                                             } else {
+                                                self.queue_translation_message(message);
                                                 self.sentence_tracker.mark_sent_for_translation(id);
                                             }
                                         }
@@ -2520,6 +2632,11 @@ impl Engine {
                         }
                     }
                 },
+                _ = queue_timer.tick() => {
+                    if let Err(e) = self.process_message_queue() {
+                        warn!("Error processing message queue: {}", e);
+                    }
+                },
                 _ = &mut ctrl_c => {
                     println!("\nReceived shutdown signal");
                     self.graceful_shutdown().await?;
@@ -2604,24 +2721,25 @@ impl Engine {
                 
                 info!("Sending final batch of {} sentences for translation", batch.len());
                 
-                // Send batch to translation window
-                if let Some(pipe) = &self.translation_pipe {
-                    for (id, content) in batch {
-                        let message = IpcMessage::Text {
-                            id,
-                            content,
-                            timestamp: SentenceTracker::current_time_ms(),
-                            is_complete: true,
-                        };
-                        
-                        if let Err(e) = pipe.write_message(&message) {
+                // Send batch to translation window using the improved message queue
+                for (id, content) in batch {
+                    let message = IpcMessage::Text {
+                        id,
+                        content,
+                        timestamp: SentenceTracker::current_time_ms(),
+                        is_complete: true,
+                    };
+                    
+                    // Send directly - don't use the queue for final messages
+                    if let Some(pipe) = &self.translation_pipe {
+                        if let Err(e) = Self::send_message_with_retry(pipe, &message, 3) {
                             warn!("Failed to send final batch text to translation window: {}", e);
                         }
                     }
-                    
-                    // Mark batch as sent
-                    self.sentence_tracker.mark_batch_sent_for_translation(&batch_ids);
                 }
+                
+                // Mark batch as sent
+                self.sentence_tracker.mark_batch_sent_for_translation(&batch_ids);
             }
         }
         
@@ -2636,7 +2754,8 @@ impl Engine {
                     is_complete: false,
                 };
                 
-                if let Err(e) = pipe.write_message(&message) {
+                // Send directly - don't use the queue for final messages
+                if let Err(e) = Self::send_message_with_retry(pipe, &message, 3) {
                     warn!("Failed to send final buffered text to translation window: {}", e);
                 } else {
                     self.sentence_tracker.mark_sent_for_translation(id);
@@ -2656,7 +2775,8 @@ impl Engine {
                         timestamp: SentenceTracker::current_time_ms(),
                         is_complete: true,
                     };
-                    if let Err(e) = pipe.write_message(&message) {
+                    // Send directly - don't use the queue for final messages
+                    if let Err(e) = Self::send_message_with_retry(pipe, &message, 3) {
                         warn!("Failed to send final text to translation window: {}", e);
                     }
                 }
@@ -2684,10 +2804,18 @@ impl Engine {
             io::stdout().flush()?;
         }
         
+        // Process any remaining queued messages
+        if !self.message_queue.is_empty() && self.translation_pipe.is_some() {
+            info!("Processing {} remaining queued messages", self.message_queue.len());
+            if let Err(e) = self.process_message_queue() {
+                warn!("Error processing final message queue: {}", e);
+            }
+        }
+        
         // Shut down the translation window if it exists
         if let Some(pipe) = &self.translation_pipe {
             info!("Shutting down translation window");
-            if let Err(e) = pipe.write_message(&IpcMessage::Shutdown) {
+            if let Err(e) = Self::send_message_with_retry(pipe, &IpcMessage::Shutdown, 3) {
                 warn!("Failed to send shutdown message to translation window: {}", e);
             }
             
@@ -2820,33 +2948,59 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
                           requests, batches, cache_hits, hit_rate * 100.0);
                 }
             },
-            _ = tokio::time::sleep(Duration::from_millis(750)) => {
-                // Force process any pending batches that haven't met the normal criteria
-                if self.translation_pipe.is_some() && !self.sentence_tracker.get_pending_batch().is_empty() {
-                    let batch = self.sentence_tracker.get_pending_batch();
-                    if !batch.is_empty() {
-                        let batch_ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
-                        
-                        debug!("Periodic flush: sending batch of {} sentences for translation", batch.len());
-                        
-                        // Send batch to translation window
-                        if let Some(pipe) = &self.translation_pipe {
-                            for (id, content) in batch {
-                                let message = IpcMessage::Text {
-                                    id,
-                                    content,
-                                    timestamp: SentenceTracker::current_time_ms(),
-                                    is_complete: true,
-                                };
-                                
-                                if let Err(e) = pipe.write_message(&message) {
-                                    warn!("Failed to send batch text to translation window: {}", e);
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                // Check for new messages with improved error handling
+                match pipe.read_message() {
+                    Ok(IpcMessage::Text { id, content, timestamp, is_complete }) => {
+                        debug!("Received text for translation [{}]: {}", id, content);
+                        if !content.is_empty() {
+                            // Process text with retry on translation failure
+                            let mut retry_count = 0;
+                            const MAX_RETRIES: usize = 3;
+                            
+                            while retry_count < MAX_RETRIES {
+                                match translation_window.process_text_message(
+                                    id, content.clone(), timestamp, is_complete, &translation_processor
+                                ).await {
+                                    Ok(_) => break,
+                                    Err(e) => {
+                                        retry_count += 1;
+                                        if retry_count >= MAX_RETRIES {
+                                            warn!("Translation failed after {} retries: {}", MAX_RETRIES, e);
+                                        } else {
+                                            debug!("Translation retry {}/{}: {}", retry_count, MAX_RETRIES, e);
+                                            tokio::time::sleep(Duration::from_millis(100 * retry_count as u64)).await;
+                                        }
+                                    }
                                 }
                             }
-                            
-                            // Mark batch as sent
-                            self.sentence_tracker.mark_batch_sent_for_translation(&batch_ids);
                         }
+                    },
+                    Ok(IpcMessage::Shutdown) => {
+                        info!("Received shutdown message");
+                        
+                        // Display final translation stats
+                        let (requests, batches, cache_hits, _, hit_rate) = translation_processor.get_stats().await;
+                        info!("Final translation stats: {} requests, {} batches, {} cache hits, {:.1}% hit rate",
+                              requests, batches, cache_hits, hit_rate * 100.0);
+                        
+                        break;
+                    },
+                    Ok(_) => {
+                        // Ignore other message types
+                    },
+                    Err(e) => {
+                        // Check if error is due to pipe being closed
+                        if let AppError::Io(io_err) = &e {
+                            if io_err.kind() == io::ErrorKind::BrokenPipe {
+                                info!("Pipe closed, shutting down");
+                                break;
+                            }
+                        }
+                        warn!("Error reading from pipe: {}", e);
+                        
+                        // Short pause before trying again to avoid CPU spinning
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
