@@ -6,7 +6,7 @@ use windows::{
     Win32::Foundation::{HWND, HANDLE, CloseHandle},
     Win32::System::Pipes::*,
     Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, WriteFile, ReadFile},
-    Win32::Security::*,
+    //Win32::Security::*,
 };
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use clap::Parser;
@@ -22,7 +22,7 @@ use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, oneshot};
 use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
-use std::collections::{HashMap, BTreeMap, HashSet};
+use std::collections::{HashMap, BTreeMap};
 
 /// Main module documentation
 /// 
@@ -768,7 +768,7 @@ impl BatchTranslationProcessor {
         {
             let mut cache_guard = cache.lock().await;
             
-            for (text, mut senders) in current_queue.drain() {
+            for (text, senders) in current_queue.drain() {
                 if let Some(cached_translation) = cache_guard.get(&text) {
                     // Cache hit, respond immediately
                     let sender_count = senders.len();
@@ -2309,7 +2309,7 @@ impl Engine {
                     
                     // Log translation statistics if enabled
                     if let Some(processor) = &self.translation_processor {
-                        let (requests, batches, cache_hits, batch_sizes, hit_rate) = processor.get_stats().await;
+                        let (requests, batches, cache_hits, _batch_sizes, hit_rate) = processor.get_stats().await;
                         info!("Translation stats: {} requests, {} batches, {} cache hits, {:.1}% hit rate", 
                               requests, batches, cache_hits, hit_rate * 100.0);
                     }
@@ -2328,7 +2328,7 @@ impl Engine {
                             // Process for translation if translation is enabled
                             if self.translation_pipe.is_some() && !text.is_empty() {
                                 // Extract complete sentences for translation
-                                let complete_sentences = self.sentence_tracker.add_text(&text);
+                                let _complete_sentences = self.sentence_tracker.add_text(&text);
                                 
                                 // Check if we should send a batch
                                 if self.sentence_tracker.should_send_batch() {
@@ -2775,7 +2775,7 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
             },
             _ = stats_timer.tick() => {
                 // Log translation statistics
-                let (requests, batches, cache_hits, batch_sizes, hit_rate) = translation_processor.get_stats().await;
+                let (requests, batches, cache_hits, _batch_sizes, hit_rate) = translation_processor.get_stats().await;
                 if requests > 0 {
                     info!("Translation stats: {} requests, {} batches, {} cache hits, {:.1}% hit rate",
                           requests, batches, cache_hits, hit_rate * 100.0);
