@@ -5,14 +5,14 @@ use windows::{
     core::*, Win32::System::Com::*, Win32::UI::{Accessibility::*, WindowsAndMessaging::*}, 
     Win32::Foundation::{HWND, HANDLE, CloseHandle},
     Win32::System::Pipes::*,
-    Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_MODE, FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, WriteFile, ReadFile},
+    Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, WriteFile, ReadFile},
     Win32::Security::*,
 };
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use thiserror::Error;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use std::io::{self, Write};
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -20,9 +20,7 @@ use std::fs;
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task;
 use std::process::{Command, Stdio};
-use std::ffi::OsString;
 use std::os::windows::process::CommandExt;
 use std::collections::{HashMap, BTreeMap};
 
@@ -89,20 +87,24 @@ impl From<windows::core::Error> for AppError {
 }
 
 /// Handler for UI Automation events
-struct CaptionEventHandler {
+#[windows::core::implement(windows::Win32::UI::Accessibility::IUIAutomationEventHandler)]
+pub struct CaptionEventHandler {
     sender: mpsc::Sender<String>,
 }
 
-#[windows::core::implement(windows::Win32::UI::Accessibility::IUIAutomationEventHandler)]
 impl CaptionEventHandler {
     fn new(sender: mpsc::Sender<String>) -> Self {
-        CaptionEventHandler { sender }
+        Self { sender }
     }
+}
 
-    fn HandleAutomationEvent(&self, sender: &Option<IUIAutomationElement>, event_id: i32) -> windows::core::Result<()> {
+impl windows::core::RuntimeName for CaptionEventHandler {}
+
+impl IUIAutomationEventHandler_Impl for CaptionEventHandler {
+    fn HandleAutomationEvent(&self, element: &core::option::Option<IUIAutomationElement>, event_id: i32) -> core::result::Result<(), core::Error> {
         // Only process TextChanged events
-        if event_id == UIA_TextPattern2_TextChangedEventId {
-            if let Some(element) = sender {
+        if event_id == UIA_TextEdit_TextChangedEventId.0 {
+            if let Some(element) = element {
                 unsafe {
                     if let Ok(name) = element.CurrentName() {
                         // Send the caption text to the processor through the channel
@@ -218,18 +220,21 @@ impl WindowsLiveCaptions {
             self.caption_receiver = new_receiver;
         }
         
+        // Get the event handler interface
+        let handler = self.event_handler.as_ref().unwrap();
+        
+        // Create the handler interface that Windows UI Automation needs
+        let handler_interface: IUIAutomationEventHandler = handler.into();
+        self.handler_interface = Some(handler_interface.clone());
+        
         // Register for text changed events
         unsafe {
-            let handler = self.event_handler.as_ref().unwrap();
-            let handler_interface: IUIAutomationEventHandler = handler.cast()?;
-            self.handler_interface = Some(handler_interface.clone());
-            
             self.automation.AddAutomationEventHandler(
-                UIA_TextPattern2_TextChangedEventId,
+                UIA_TextEdit_TextChangedEventId,
                 &text_element,
                 TreeScope_Element,
                 None,
-                &self.handler_interface.as_ref().unwrap(),
+                self.handler_interface.as_ref().unwrap(),
             )?;
         }
         
@@ -258,7 +263,7 @@ impl WindowsLiveCaptions {
         if let Some(text_element) = self.element_cache.get(&CacheKey::TextElement(self.last_window_handle.0)) {
             unsafe {
                 self.automation.RemoveAutomationEventHandler(
-                    UIA_TextPattern2_TextChangedEventId,
+                    UIA_TextEdit_TextChangedEventId,
                     text_element,
                     self.handler_interface.as_ref().unwrap(),
                 )?;
@@ -1731,15 +1736,14 @@ impl Engine {
         
         // Create a channel for immediate caption checking
         let (caption_tx, mut caption_rx) = mpsc::channel::<()>(1);
-        let caption_handle_clone = self.caption_handle.clone();
         
         // Create a task for continuous caption checking in event-based mode
-        let caption_task = if self.config.use_events {
+        let _caption_task = if self.config.use_events {
             let tx = caption_tx.clone();
             Some(tokio::spawn(async move {
                 loop {
                     // Check for captions
-                    if let Err(e) = tx.send(()).await {
+                    if let Err(_) = tx.send(()).await {
                         break; // Channel closed, exit
                     }
                     // Brief sleep to avoid tight loop
@@ -1791,11 +1795,11 @@ impl Engine {
                     }
                 },
                 _ = async { if let Some(ref mut timer) = caption_timer { timer.tick().await } else { std::future::pending().await } }, if !self.config.use_events => {
-                    self.process_captions().await?;
+                    self.process_captions(&mut caption_timer).await?;
                 },
                 _ = caption_rx.recv() => {
                     if self.config.use_events {
-                        self.process_captions().await?;
+                        self.process_captions(&mut caption_timer).await?;
                     }
                 },
                 _ = &mut ctrl_c => {
@@ -1809,7 +1813,7 @@ impl Engine {
     }
     
     /// Processes captured captions
-    async fn process_captions(&mut self) -> Result<(), AppError> {
+    async fn process_captions(&mut self, caption_timer: &mut Option<tokio::time::Interval>) -> Result<(), AppError> {
         info!("Checking for new captions");
         match self.caption_handle.get_captions().await {
             Ok(Some(text)) => {
@@ -1884,7 +1888,7 @@ impl Engine {
                 }
             },
             Ok(None) => {
-                info!("No new captions available");
+                debug!("No new captions available");
                 
                 // Check if we should send any buffered text due to inactivity
                 if self.translation_pipe.is_some() && self.consecutive_empty_captures > 2 {
@@ -2239,7 +2243,7 @@ async fn create_engine() -> Result<Engine, AppError> {
     if let Some(enable) = args.enable_translation {
         config.enable_translation = enable;
     }
-    if let Some(lang) = args.target_language {
+	if let Some(lang) = args.target_language {
         config.target_language = Some(lang);
     }
     if let Some(use_events) = args.use_events {
