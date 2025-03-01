@@ -22,7 +22,7 @@ use similar::{ChangeTag, TextDiff};
 use tokio::sync::{mpsc, oneshot};
 use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{HashMap, BTreeMap, HashSet};
 
 /// Main module documentation
 /// 
@@ -538,6 +538,82 @@ impl RateLimiter {
     }
 }
 
+/// Translation cache for storing previous translations
+struct TranslationCache {
+    // Using an LRU cache with default capacity of 1000 entries
+    cache: LruCache<String, String>,
+    hits: usize,
+    misses: usize,
+}
+
+impl TranslationCache {
+    /// Creates a new translation cache with the specified capacity
+    fn new(capacity: usize) -> Self {
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap())),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Gets a translation from the cache
+    /// 
+    /// # Arguments
+    /// 
+    /// * `text` - The text to look up
+    /// 
+    /// # Returns
+    /// 
+    /// * `Some(String)` - The translation was found in the cache
+    /// * `None` - The translation was not found in the cache
+    fn get(&mut self, text: &str) -> Option<String> {
+        if let Some(translation) = self.cache.get(text) {
+            self.hits += 1;
+            Some(translation.clone())
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Puts a translation in the cache
+    /// 
+    /// # Arguments
+    /// 
+    /// * `text` - The original text
+    /// * `translation` - The translated text
+    fn put(&mut self, text: String, translation: String) {
+        self.cache.put(text, translation);
+    }
+
+    /// Adds multiple translations to the cache at once
+    /// 
+    /// # Arguments
+    /// 
+    /// * `texts` - The original texts
+    /// * `translations` - The translated texts
+    fn put_batch(&mut self, texts: Vec<String>, translations: Vec<String>) {
+        for (text, translation) in texts.into_iter().zip(translations.into_iter()) {
+            self.cache.put(text, translation);
+        }
+    }
+
+    /// Gets the hit rate of the cache
+    fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+
+    /// Gets stats for the cache
+    fn stats(&self) -> (usize, usize, usize, f64) {
+        (self.cache.len(), self.hits, self.misses, self.hit_rate())
+    }
+}
+
 /// Trait defining a translation service
 #[async_trait::async_trait]
 trait TranslationService: Send + Sync {
@@ -553,11 +629,267 @@ trait TranslationService: Send + Sync {
     /// * `Err(AppError)` - Translation failed
     async fn translate(&self, text: &str) -> Result<String, AppError>;
     
+    /// Batch translates multiple texts
+    /// 
+    /// # Arguments
+    /// 
+    /// * `texts` - The texts to translate
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(Vec<String>)` - The translated texts
+    /// * `Err(AppError)` - Translation failed
+    async fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, AppError> {
+        // Default implementation translates each text individually
+        let mut results = Vec::with_capacity(texts.len());
+        for text in texts {
+            results.push(self.translate(text).await?);
+        }
+        Ok(results)
+    }
+    
     /// Gets the name of the translation service
     fn get_name(&self) -> &str;
     
     /// Gets the target language code
     fn get_target_language(&self) -> &str;
+}
+
+/// Batch processor for translation requests
+struct BatchTranslationProcessor {
+    service: Arc<dyn TranslationService>,
+    cache: Arc<tokio::sync::Mutex<TranslationCache>>,
+    queue: Arc<tokio::sync::Mutex<HashMap<String, Vec<oneshot::Sender<Result<String, AppError>>>>>>,
+    batch_size: usize,
+    max_batch_delay: Duration,
+    stats: Arc<tokio::sync::Mutex<BatchStats>>,
+}
+
+/// Statistics for batch processing
+#[derive(Debug, Default)]
+struct BatchStats {
+    requests: usize,
+    batches: usize,
+    cache_hits: usize,
+    batch_sizes: Vec<usize>,
+}
+
+impl BatchTranslationProcessor {
+    /// Creates a new batch processor
+    fn new(
+        service: Arc<dyn TranslationService>,
+        cache_size: usize,
+        batch_size: usize,
+        max_batch_delay_ms: u64,
+    ) -> Self {
+        let processor = Self {
+            service,
+            cache: Arc::new(tokio::sync::Mutex::new(TranslationCache::new(cache_size))),
+            queue: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            batch_size,
+            max_batch_delay: Duration::from_millis(max_batch_delay_ms),
+            stats: Arc::new(tokio::sync::Mutex::new(BatchStats::default())),
+        };
+        
+        // Start the batch processing loop
+        processor.start_processing_loop();
+        
+        processor
+    }
+    
+    /// Starts the background processing loop
+    fn start_processing_loop(&self) {
+        let service = self.service.clone();
+        let queue = self.queue.clone();
+        let cache = self.cache.clone();
+        let batch_size = self.batch_size;
+        let max_batch_delay = self.max_batch_delay;
+        let stats = self.stats.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(max_batch_delay);
+            
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // Process any pending translations
+                        let should_process = {
+                            let queue_guard = queue.lock().await;
+                            !queue_guard.is_empty()
+                        };
+                        
+                        if should_process {
+                            if let Err(e) = Self::process_batch(&service, &queue, &cache, &stats).await {
+                                warn!("Failed to process translation batch: {}", e);
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        // Check if we have enough translations to process
+                        let should_process = {
+                            let queue_guard = queue.lock().await;
+                            let queue_size: usize = queue_guard.values().map(|v| v.len()).sum();
+                            queue_size >= batch_size
+                        };
+                        
+                        if should_process {
+                            if let Err(e) = Self::process_batch(&service, &queue, &cache, &stats).await {
+                                warn!("Failed to process translation batch: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
+    /// Processes a batch of translation requests
+    async fn process_batch(
+        service: &Arc<dyn TranslationService>,
+        queue: &Arc<tokio::sync::Mutex<HashMap<String, Vec<oneshot::Sender<Result<String, AppError>>>>>>,
+        cache: &Arc<tokio::sync::Mutex<TranslationCache>>,
+        stats: &Arc<tokio::sync::Mutex<BatchStats>>,
+    ) -> Result<(), AppError> {
+        // Take the current queue
+        let mut current_queue = {
+            let mut queue_guard = queue.lock().await;
+            std::mem::take(&mut *queue_guard)
+        };
+        
+        if current_queue.is_empty() {
+            return Ok(());
+        }
+        
+        // Collect texts to translate
+        let mut texts_to_translate = Vec::new();
+        let mut senders = HashMap::new();
+        
+        // Check cache first
+        {
+            let mut cache_guard = cache.lock().await;
+            
+            for (text, text_senders) in current_queue.iter_mut() {
+                if let Some(cached_translation) = cache_guard.get(text) {
+                    // Cache hit, respond immediately
+                    for sender in text_senders.drain(..) {
+                        let _ = sender.send(Ok(cached_translation.clone()));
+                    }
+                    
+                    // Update stats
+                    let mut stats_guard = stats.lock().await;
+                    stats_guard.cache_hits += text_senders.len();
+                } else if !text_senders.is_empty() {
+                    // Cache miss, add to translation batch
+                    texts_to_translate.push(text.clone());
+                    senders.insert(text.clone(), text_senders.clone());
+                }
+            }
+        }
+        
+        // Translate batch
+        if !texts_to_translate.is_empty() {
+            {
+                // Update stats
+                let mut stats_guard = stats.lock().await;
+                stats_guard.batches += 1;
+                stats_guard.batch_sizes.push(texts_to_translate.len());
+            }
+            
+            debug!("Processing batch of {} translations", texts_to_translate.len());
+            
+            let translations = service.translate_batch(&texts_to_translate).await?;
+            
+            // Cache results and respond to senders
+            {
+                let mut cache_guard = cache.lock().await;
+                
+                for (i, text) in texts_to_translate.iter().enumerate() {
+                    if i < translations.len() {
+                        let translation = translations[i].clone();
+                        
+                        // Cache the result
+                        cache_guard.put(text.clone(), translation.clone());
+                        
+                        // Respond to all senders for this text
+                        if let Some(text_senders) = senders.get(text) {
+                            for sender in text_senders {
+                                let _ = sender.send(Ok(translation.clone()));
+                            }
+                        }
+                    } else {
+                        // This shouldn't happen, but handle it anyway
+                        if let Some(text_senders) = senders.get(text) {
+                            for sender in text_senders {
+                                let _ = sender.send(Err(AppError::Translation("Batch translation returned fewer results than expected".to_string())));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Translates text with caching and batching
+    /// 
+    /// # Arguments
+    /// 
+    /// * `text` - The text to translate
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(String)` - The translated text
+    /// * `Err(AppError)` - Translation failed
+    async fn translate(&self, text: &str) -> Result<String, AppError> {
+        // Update stats
+        {
+            let mut stats_guard = self.stats.lock().await;
+            stats_guard.requests += 1;
+        }
+        
+        // Check cache first
+        {
+            let mut cache_guard = self.cache.lock().await;
+            if let Some(cached) = cache_guard.get(text) {
+                // Update stats
+                let mut stats_guard = self.stats.lock().await;
+                stats_guard.cache_hits += 1;
+                
+                return Ok(cached);
+            }
+        }
+        
+        // Create a channel for the result
+        let (sender, receiver) = oneshot::channel();
+        
+        // Add to queue
+        {
+            let mut queue_guard = self.queue.lock().await;
+            queue_guard.entry(text.to_string())
+                .or_insert_with(Vec::new)
+                .push(sender);
+        }
+        
+        // Wait for result
+        receiver.await.map_err(|_| AppError::Translation("Translation task cancelled".to_string()))?
+    }
+    
+    /// Gets statistics about the batch processor
+    async fn get_stats(&self) -> (usize, usize, usize, Vec<usize>, f64) {
+        let stats_guard = self.stats.lock().await;
+        let cache_guard = self.cache.lock().await;
+        
+        let (_, _, _, hit_rate) = cache_guard.stats();
+        
+        (
+            stats_guard.requests,
+            stats_guard.batches,
+            stats_guard.cache_hits,
+            stats_guard.batch_sizes.clone(),
+            hit_rate,
+        )
+    }
 }
 
 /// Demo Translation Service implementation
@@ -569,6 +901,15 @@ struct DemoTranslation {
 impl TranslationService for DemoTranslation {
     async fn translate(&self, text: &str) -> Result<String, AppError> {
         Ok(format!("[{} Translation]: {}", self.target_language, text))
+    }
+    
+    // Override the default batch implementation with a more efficient one
+    async fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, AppError> {
+        let mut results = Vec::with_capacity(texts.len());
+        for text in texts {
+            results.push(format!("[{} Translation]: {}", self.target_language, text));
+        }
+        Ok(results)
     }
     
     fn get_name(&self) -> &str {
@@ -633,6 +974,64 @@ impl TranslationService for DeepLTranslation {
         }
     }
     
+    // Implement batch translation for DeepL
+    async fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, AppError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Rate limiting
+        self.rate_limiter.lock().await.wait().await;
+        
+        // DeepL API supports batch translation natively
+        let url = "https://api-free.deepl.com/v2/translate";
+        
+        // Build form data with multiple text entries
+        let mut form = Vec::new();
+        for text in texts {
+            form.push(("text", text.as_str()));
+        }
+        form.push(("target_lang", self.target_language.as_str()));
+        form.push(("source_lang", "EN"));
+        
+        let response = self.client.post(url)
+            .header("Authorization", format!("DeepL-Auth-Key {}", self.api_key))
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to send batch translation request to DeepL: {}", e)))?;
+                
+        if !response.status().is_success() {
+            return Err(AppError::Translation(format!("DeepL API error: {}", response.status())));
+        }
+        
+        #[derive(Deserialize)]
+        struct DeepLResponse {
+            translations: Vec<Translation>,
+        }
+        
+        #[derive(Deserialize)]
+        struct Translation {
+            text: String,
+        }
+        
+        let result: DeepLResponse = response.json()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to parse DeepL batch response: {}", e)))?;
+        
+        if result.translations.len() != texts.len() {
+            return Err(AppError::Translation(format!("DeepL returned {} translations for {} texts", 
+                                                    result.translations.len(), texts.len())));
+        }
+        
+        // Extract translations
+        let translations = result.translations.into_iter()
+            .map(|t| t.text)
+            .collect();
+        
+        Ok(translations)
+    }
+    
     fn get_name(&self) -> &str {
         "DeepL"
     }
@@ -683,6 +1082,60 @@ impl TranslationService for GenericTranslation {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| AppError::Translation("Invalid translation response format".to_string()))
+    }
+    
+    // Implement batch translation if the API supports it
+    async fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, AppError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Rate limiting
+        self.rate_limiter.lock().await.wait().await;
+        
+        // Generic batch API call
+        let url = "https://translation-api.example.com/translate/batch";
+        
+        let response = self.client.post(url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({
+                "texts": texts,
+                "source_language": "auto",
+                "target_language": self.target_language
+            }))
+            .send()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to send batch translation request: {}", e)))?;
+                
+        if !response.status().is_success() {
+            return Err(AppError::Translation(format!("Translation API error: {}", response.status())));
+        }
+        
+        let result: serde_json::Value = response.json()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to parse batch translation response: {}", e)))?;
+        
+        // Extract translations array from the response
+        let translations = result.get("translations")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| AppError::Translation("Invalid batch translation response format".to_string()))?;
+        
+        if translations.len() != texts.len() {
+            return Err(AppError::Translation(format!("Received {} translations for {} texts", 
+                                                   translations.len(), texts.len())));
+        }
+        
+        // Extract translated texts
+        let mut results = Vec::with_capacity(translations.len());
+        for translation in translations {
+            let translated_text = translation.get("translated_text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AppError::Translation("Invalid translation entry in response".to_string()))?;
+            
+            results.push(translated_text.to_string());
+        }
+        
+        Ok(results)
     }
     
     fn get_name(&self) -> &str {
@@ -767,6 +1220,95 @@ impl TranslationService for OpenAITranslation {
         }
     }
     
+    // Implement batch translation for OpenAI
+    // Since OpenAI doesn't have a native batch endpoint, we'll use a delimiter approach
+    async fn translate_batch(&self, texts: &[String]) -> Result<Vec<String>, AppError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Rate limiting
+        self.rate_limiter.lock().await.wait().await;
+        
+        // Use a special delimiter unlikely to appear in the text
+        const DELIMITER: &str = "|||SPLIT|||";
+        
+        // Join texts with delimiter
+        let combined_text = texts.join(&format!(" {} ", DELIMITER));
+        
+        // Construct request body
+        let request_body = serde_json::json!({
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": format!("{} 
+                    You will be given multiple texts separated by the delimiter '{}'. 
+                    Translate each text to {} and keep them separated by the same delimiter.", 
+                    self.system_prompt, DELIMITER, self.target_language)
+                },
+                {
+                    "role": "user",
+                    "content": combined_text
+                }
+            ],
+            "temperature": 0.3
+        });
+        
+        // Send request
+        let response = self.client.post(&self.api_url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to send batch translation request to OpenAI compatible API: {}", e)))?;
+                
+        if !response.status().is_success() {
+            return Err(AppError::Translation(format!("OpenAI API error: {}", response.status())));
+        }
+        
+        // Parse response
+        #[derive(Deserialize)]
+        struct OpenAIResponse {
+            choices: Vec<Choice>,
+        }
+        
+        #[derive(Deserialize)]
+        struct Choice {
+            message: Message,
+        }
+        
+        #[derive(Deserialize)]
+        struct Message {
+            content: String,
+        }
+        
+        let result: OpenAIResponse = response.json()
+            .await
+            .map_err(|e| AppError::Translation(format!("Failed to parse OpenAI response: {}", e)))?;
+        
+        if let Some(choice) = result.choices.first() {
+            // Split response by delimiter
+            let translated_texts: Vec<String> = choice.message.content
+                .split(DELIMITER)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            // Verify we got the expected number of translations
+            if translated_texts.len() != texts.len() {
+                return Err(AppError::Translation(format!(
+                    "Received {} translations for {} texts", translated_texts.len(), texts.len()
+                )));
+            }
+            
+            Ok(translated_texts)
+        } else {
+            Err(AppError::Translation("Empty translation result from OpenAI".to_string()))
+        }
+    }
+    
     fn get_name(&self) -> &str {
         "OpenAI"
     }
@@ -776,20 +1318,24 @@ impl TranslationService for OpenAITranslation {
     }
 }
 
-/// Factory function to create the appropriate translation service
-fn create_translation_service(
+/// Factory function to create a batch translation processor
+fn create_batch_translation_processor(
     api_key: String,
     target_language: String,
     api_type: TranslationApiType,
     openai_api_url: Option<String>,
     openai_model: Option<String>,
     openai_system_prompt: Option<String>,
-) -> Arc<dyn TranslationService> {
-    match api_type {
+    cache_size: usize,
+    batch_size: usize,
+    batch_delay_ms: u64,
+) -> BatchTranslationProcessor {
+    // Create the underlying translation service
+    let service = match api_type {
         TranslationApiType::Demo => {
             Arc::new(DemoTranslation {
                 target_language,
-            })
+            }) as Arc<dyn TranslationService>
         },
         TranslationApiType::DeepL => {
             Arc::new(DeepLTranslation {
@@ -797,7 +1343,7 @@ fn create_translation_service(
                 target_language,
                 client: reqwest::Client::new(),
                 rate_limiter: tokio::sync::Mutex::new(RateLimiter::new(500)), // 500ms between requests
-            })
+            }) as Arc<dyn TranslationService>
         },
         TranslationApiType::Generic => {
             Arc::new(GenericTranslation {
@@ -805,7 +1351,7 @@ fn create_translation_service(
                 target_language,
                 client: reqwest::Client::new(),
                 rate_limiter: tokio::sync::Mutex::new(RateLimiter::new(500)),
-            })
+            }) as Arc<dyn TranslationService>
         },
         TranslationApiType::OpenAI => {
             Arc::new(OpenAITranslation {
@@ -818,9 +1364,12 @@ fn create_translation_service(
                     "You are a translator. Translate the following text to the target language. Only respond with the translation, no explanations.".to_string()
                 ),
                 rate_limiter: tokio::sync::Mutex::new(RateLimiter::new(1000)), // OpenAI might need more time between requests
-            })
+            }) as Arc<dyn TranslationService>
         },
-    }
+    };
+    
+    // Create the batch processor
+    BatchTranslationProcessor::new(service, cache_size, batch_size, batch_delay_ms)
 }
 
 /// Keys for UI element caching
@@ -880,6 +1429,16 @@ struct Config {
     
     #[serde(default = "default_active_timeout_sec")]
     active_timeout_sec: f64,      // How long to stay in active mode (seconds)
+    
+    // Translation batch and cache settings (new additions)
+    #[serde(default = "default_translation_cache_size")]
+    translation_cache_size: usize, // Maximum number of entries in the translation cache
+    
+    #[serde(default = "default_translation_batch_size")]
+    translation_batch_size: usize, // Maximum number of texts to translate in a batch
+    
+    #[serde(default = "default_translation_batch_delay_ms")]
+    translation_batch_delay_ms: u64, // Maximum delay before processing a batch (milliseconds)
 }
 
 // Default value functions for serde
@@ -892,6 +1451,9 @@ fn default_ultra_responsive() -> bool { true }
 fn default_active_interval_ms() -> u64 { 50 }  // 50ms polling when active (very responsive)
 fn default_idle_interval_ms() -> u64 { 500 }   // 500ms polling when idle
 fn default_active_timeout_sec() -> f64 { 5.0 } // 5 seconds after last caption
+fn default_translation_cache_size() -> usize { 1000 } // Cache 1000 translations
+fn default_translation_batch_size() -> usize { 5 }   // Translate 5 texts at a time
+fn default_translation_batch_delay_ms() -> u64 { 500 } // Wait 500ms max for batch accumulation
 
 impl Config {
     /// Loads configuration from a file, creating a default if it doesn't exist
@@ -999,6 +1561,19 @@ impl Config {
                     warn!("No OpenAI model specified, will use default");
                 }
             }
+            
+            // Validate batch and cache settings
+            if self.translation_cache_size == 0 {
+                return Err(AppError::Validation("Translation cache size cannot be zero".to_string()));
+            }
+            
+            if self.translation_batch_size == 0 {
+                return Err(AppError::Validation("Translation batch size cannot be zero".to_string()));
+            }
+            
+            if self.translation_batch_delay_ms == 0 {
+                return Err(AppError::Validation("Translation batch delay cannot be zero".to_string()));
+            }
         }
         
         // Validate ultra-responsive mode settings
@@ -1040,15 +1615,22 @@ impl Default for Config {
             active_interval_ms: default_active_interval_ms(),
             idle_interval_ms: default_idle_interval_ms(),
             active_timeout_sec: default_active_timeout_sec(),
+            translation_cache_size: default_translation_cache_size(),
+            translation_batch_size: default_translation_batch_size(),
+            translation_batch_delay_ms: default_translation_batch_delay_ms(),
         }
     }
 }
 
-/// Sentence tracker for maintaining sentence-level synchronization
+/// Sentence tracker for maintaining sentence-level synchronization with batching support
 struct SentenceTracker {
     next_id: u64,
     pending_sentences: HashMap<u64, PendingSentence>,
     buffered_text: String,
+    // New fields to support batching
+    batch_size: usize,
+    batch_timeout_ms: u64,
+    last_batch_time: u64,
 }
 
 struct PendingSentence {
@@ -1058,11 +1640,14 @@ struct PendingSentence {
 }
 
 impl SentenceTracker {
-    fn new() -> Self {
+    fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
         Self {
             next_id: 1,
             pending_sentences: HashMap::new(),
             buffered_text: String::new(),
+            batch_size,
+            batch_timeout_ms,
+            last_batch_time: Self::current_time_ms(),
         }
     }
     
@@ -1136,11 +1721,38 @@ impl SentenceTracker {
         Some(result)
     }
     
+    /// Check if we have enough sentences to form a batch
+    fn should_send_batch(&self) -> bool {
+        let unsent_count = self.pending_sentences.values()
+            .filter(|s| !s.sent_for_translation)
+            .count();
+        
+        // Send if we have enough sentences or enough time has passed
+        unsent_count >= self.batch_size || 
+            (unsent_count > 0 && Self::current_time_ms() - self.last_batch_time >= self.batch_timeout_ms)
+    }
+    
+    /// Get all pending sentences that haven't been sent yet
+    fn get_pending_batch(&self) -> Vec<(u64, String)> {
+        self.pending_sentences.iter()
+            .filter(|(_, s)| !s.sent_for_translation)
+            .map(|(id, s)| (*id, s.original.clone()))
+            .collect()
+    }
+    
     /// Mark a sentence as sent for translation
     fn mark_sent_for_translation(&mut self, id: u64) {
         if let Some(sentence) = self.pending_sentences.get_mut(&id) {
             sentence.sent_for_translation = true;
         }
+    }
+    
+    /// Mark multiple sentences as sent for translation
+    fn mark_batch_sent_for_translation(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.mark_sent_for_translation(*id);
+        }
+        self.last_batch_time = Self::current_time_ms();
     }
     
     /// Get current timestamp in milliseconds
@@ -1335,6 +1947,7 @@ struct Args {
 struct TranslationWindow {
     sentences: BTreeMap<u64, TranslatedSentence>,
     displayed_text: String,
+    pending_translations: HashMap<u64, PendingTranslation>,
 }
 
 struct TranslatedSentence {
@@ -1345,11 +1958,18 @@ struct TranslatedSentence {
     is_complete: bool,
 }
 
+struct PendingTranslation {
+    content: String,
+    timestamp: u64,
+    is_complete: bool,
+}
+
 impl TranslationWindow {
     fn new() -> Self {
         Self {
             sentences: BTreeMap::new(),
             displayed_text: String::new(),
+            pending_translations: HashMap::new(),
         }
     }
     
@@ -1360,10 +1980,22 @@ impl TranslationWindow {
         content: String, 
         timestamp: u64,
         is_complete: bool,
-        translation_service: &Arc<dyn TranslationService>
+        translation_processor: &BatchTranslationProcessor
     ) -> Result<(), AppError> {
-        // Translate the text
-        match translation_service.translate(&content).await {
+        // First check if this is a duplicate (might happen with batching)
+        if self.sentences.contains_key(&id) {
+            return Ok(());
+        }
+        
+        // Add to pending translations
+        self.pending_translations.insert(id, PendingTranslation {
+            content: content.clone(),
+            timestamp,
+            is_complete,
+        });
+        
+        // Translate the text with batching and caching
+        match translation_processor.translate(&content).await {
             Ok(translated) => {
                 // Store the translated sentence
                 self.sentences.insert(id, TranslatedSentence {
@@ -1373,6 +2005,9 @@ impl TranslationWindow {
                     timestamp,
                     is_complete,
                 });
+                
+                // Remove from pending
+                self.pending_translations.remove(&id);
                 
                 // Update the displayed text
                 self.update_display();
@@ -1428,6 +2063,16 @@ impl TranslationWindow {
             }
         }
     }
+    
+    /// Checks if there are pending translations
+    fn has_pending_translations(&self) -> bool {
+        !self.pending_translations.is_empty()
+    }
+    
+    /// Gets the IDs of pending translations
+    fn get_pending_translation_ids(&self) -> Vec<u64> {
+        self.pending_translations.keys().cloned().collect()
+    }
 }
 
 /// Main engine for the caption process
@@ -1435,7 +2080,7 @@ struct Engine {
     config: Config,
     displayed_text: String, // Text displayed in the terminal
     caption_handle: CaptionHandle,
-    translation_service: Option<Arc<dyn TranslationService>>,
+    translation_processor: Option<BatchTranslationProcessor>,
     consecutive_empty_captures: usize, // Count of consecutive empty captures
     adaptive_interval: f64, // Adaptive capture interval
     output_file: Option<fs::File>, // Output file handle
@@ -1461,8 +2106,8 @@ impl Engine {
         // Create caption handle
         let caption_handle = CaptionHandle::new()?;
         
-        // Create translation service if enabled
-        let translation_service = if config.enable_translation {
+        // Create translation processor if enabled
+        let translation_processor = if config.enable_translation {
             if let Some(api_key) = &config.translation_api_key {
                 // Ensure target language is set
                 let target_lang = config.target_language.clone().unwrap_or_else(|| {
@@ -1473,25 +2118,31 @@ impl Engine {
                     }
                 });
                 
-                info!("Initializing translation service with {:?} API", config.translation_api_type);
-                Some(create_translation_service(
+                info!("Initializing translation service with {:?} API, caching and batching", config.translation_api_type);
+                Some(create_batch_translation_processor(
                     api_key.clone(),
                     target_lang,
                     config.translation_api_type,
                     config.openai_api_url.clone(),
                     config.openai_model.clone(),
-                    config.openai_system_prompt.clone()
+                    config.openai_system_prompt.clone(),
+                    config.translation_cache_size,
+                    config.translation_batch_size,
+                    config.translation_batch_delay_ms
                 ))
             } else if config.translation_api_type == TranslationApiType::Demo {
                 // Demo mode doesn't need an API key
                 let target_lang = config.target_language.clone().unwrap_or_else(|| "zh-CN".to_string());
-                Some(create_translation_service(
+                Some(create_batch_translation_processor(
                     "".to_string(),
                     target_lang,
                     TranslationApiType::Demo,
                     None,
                     None,
-                    None
+                    None,
+                    config.translation_cache_size,
+                    config.translation_batch_size,
+                    config.translation_batch_delay_ms
                 ))
             } else {
                 warn!("Translation enabled but no API key provided");
@@ -1558,14 +2209,17 @@ impl Engine {
         Ok(Self {
             displayed_text: String::new(),
             caption_handle,
-            translation_service,
+            translation_processor,
             consecutive_empty_captures: 0,
             adaptive_interval: config.min_interval,
             output_file,
             config,
             translation_process,
             translation_pipe,
-            sentence_tracker: SentenceTracker::new(),
+            sentence_tracker: SentenceTracker::new(
+                config.translation_batch_size,
+                config.translation_batch_delay_ms
+            ),
         })
     }
 
@@ -1609,8 +2263,15 @@ impl Engine {
         }
         println!("  - Check interval: {} seconds", self.config.check_interval);
         if self.config.enable_translation {
-            println!("  - Translation enabled: {}", self.translation_service.as_ref().map_or("No", |s| s.get_name()));
-            println!("  - Target language: {}", self.translation_service.as_ref().map_or("None", |s| s.get_target_language()));
+            println!("  - Translation enabled with batch processing and caching");
+            if let Some(processor) = &self.translation_processor {
+                let service = processor.service.as_ref();
+                println!("    - Translation service: {}", service.get_name());
+                println!("    - Target language: {}", service.get_target_language());
+                println!("    - Cache size: {} entries", self.config.translation_cache_size);
+                println!("    - Batch size: {} texts", self.config.translation_batch_size);
+                println!("    - Batch delay: {}ms", self.config.translation_batch_delay_ms);
+            }
             if self.translation_pipe.is_some() {
                 println!("  - Translation will be displayed in a separate window");
             }
@@ -1640,6 +2301,13 @@ impl Engine {
                             return Err(e);
                         }
                     }
+                    
+                    // Log translation statistics if enabled
+                    if let Some(processor) = &self.translation_processor {
+                        let (requests, batches, cache_hits, batch_sizes, hit_rate) = processor.get_stats().await;
+                        info!("Translation stats: {} requests, {} batches, {} cache hits, {:.1}% hit rate", 
+                              requests, batches, cache_hits, hit_rate * 100.0);
+                    }
                 },
                 _ = caption_timer.tick() => {
                     // Process captions
@@ -1657,21 +2325,31 @@ impl Engine {
                                 // Extract complete sentences for translation
                                 let complete_sentences = self.sentence_tracker.add_text(&text);
                                 
-                                // Send complete sentences for translation
-                                for (id, sentence) in complete_sentences {
-                                    if let Some(pipe) = &self.translation_pipe {
-                                        debug!("Sending complete sentence for translation [{}]: {}", id, sentence);
-                                        let message = IpcMessage::Text {
-                                            id,
-                                            content: sentence,
-                                            timestamp: SentenceTracker::current_time_ms(),
-                                            is_complete: true,
-                                        };
+                                // Check if we should send a batch
+                                if self.sentence_tracker.should_send_batch() {
+                                    let batch = self.sentence_tracker.get_pending_batch();
+                                    if !batch.is_empty() {
+                                        let batch_ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
                                         
-                                        if let Err(e) = pipe.write_message(&message) {
-                                            warn!("Failed to send text to translation window: {}", e);
-                                        } else {
-                                            self.sentence_tracker.mark_sent_for_translation(id);
+                                        debug!("Sending batch of {} sentences for translation", batch.len());
+                                        
+                                        // Send batch to translation window
+                                        if let Some(pipe) = &self.translation_pipe {
+                                            for (id, content) in batch {
+                                                let message = IpcMessage::Text {
+                                                    id,
+                                                    content,
+                                                    timestamp: SentenceTracker::current_time_ms(),
+                                                    is_complete: true,
+                                                };
+                                                
+                                                if let Err(e) = pipe.write_message(&message) {
+                                                    warn!("Failed to send batch text to translation window: {}", e);
+                                                }
+                                            }
+                                            
+                                            // Mark batch as sent
+                                            self.sentence_tracker.mark_batch_sent_for_translation(&batch_ids);
                                         }
                                     }
                                 }
@@ -1741,6 +2419,36 @@ impl Engine {
                             
                             // Check if we should send any buffered text due to inactivity
                             if self.translation_pipe.is_some() && self.consecutive_empty_captures > 2 {
+                                // Check if we have any pending sentences to send as a batch
+                                if self.sentence_tracker.should_send_batch() {
+                                    let batch = self.sentence_tracker.get_pending_batch();
+                                    if !batch.is_empty() {
+                                        let batch_ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
+                                        
+                                        debug!("Sending batch of {} sentences for translation due to inactivity", batch.len());
+                                        
+                                        // Send batch to translation window
+                                        if let Some(pipe) = &self.translation_pipe {
+                                            for (id, content) in batch {
+                                                let message = IpcMessage::Text {
+                                                    id,
+                                                    content,
+                                                    timestamp: SentenceTracker::current_time_ms(),
+                                                    is_complete: true,
+                                                };
+                                                
+                                                if let Err(e) = pipe.write_message(&message) {
+                                                    warn!("Failed to send batch text to translation window: {}", e);
+                                                }
+                                            }
+                                            
+                                            // Mark batch as sent
+                                            self.sentence_tracker.mark_batch_sent_for_translation(&batch_ids);
+                                        }
+                                    }
+                                }
+                                
+                                // Also check for incomplete sentences
                                 if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
                                     if let Some(pipe) = &self.translation_pipe {
                                         debug!("Sending buffered text for translation due to inactivity [{}]: {}", id, text);
@@ -1844,7 +2552,36 @@ impl Engine {
     async fn graceful_shutdown(&mut self) -> Result<(), AppError> {
         info!("Performing graceful shutdown");
         
-        // Send any remaining buffered text for translation
+        // Process any remaining pending sentences as a batch
+        if self.translation_pipe.is_some() {
+            let batch = self.sentence_tracker.get_pending_batch();
+            if !batch.is_empty() {
+                let batch_ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
+                
+                info!("Sending final batch of {} sentences for translation", batch.len());
+                
+                // Send batch to translation window
+                if let Some(pipe) = &self.translation_pipe {
+                    for (id, content) in batch {
+                        let message = IpcMessage::Text {
+                            id,
+                            content,
+                            timestamp: SentenceTracker::current_time_ms(),
+                            is_complete: true,
+                        };
+                        
+                        if let Err(e) = pipe.write_message(&message) {
+                            warn!("Failed to send final batch text to translation window: {}", e);
+                        }
+                    }
+                    
+                    // Mark batch as sent
+                    self.sentence_tracker.mark_batch_sent_for_translation(&batch_ids);
+                }
+            }
+        }
+        
+        // Also send any incomplete sentences
         if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
             if let Some(pipe) = &self.translation_pipe {
                 info!("Sending final buffered text for translation [{}]: {}", id, text);
@@ -1857,6 +2594,8 @@ impl Engine {
                 
                 if let Err(e) = pipe.write_message(&message) {
                     warn!("Failed to send final buffered text to translation window: {}", e);
+                } else {
+                    self.sentence_tracker.mark_sent_for_translation(id);
                 }
             }
         }
@@ -1926,7 +2665,7 @@ impl Engine {
 fn display_translation_window(text: &str) -> Result<(), AppError> {
     // Clear screen and move to top-left corner
     print!("\x1B[2J\x1B[1;1H");
-    println!("Translation Window");
+    println!("Translation Window (with Batch Processing and Caching)");
     println!("----------------------------------------");
     println!("{}", text);
     io::stdout().flush()?;
@@ -1952,8 +2691,8 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
     
     info!("Received configuration");
     
-    // Create translation service
-    let translation_service = if let Some(api_key) = &config.translation_api_key {
+    // Create translation service with batching and caching
+    let translation_processor = if let Some(api_key) = &config.translation_api_key {
         // Ensure target language is set
         let target_lang = config.target_language.clone().unwrap_or_else(|| {
             match config.translation_api_type {
@@ -1963,36 +2702,42 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
             }
         });
         
-        info!("Initializing translation service with {:?} API", config.translation_api_type);
-        Some(create_translation_service(
+        info!("Initializing translation service with {:?} API, caching and batching", config.translation_api_type);
+        Some(create_batch_translation_processor(
             api_key.clone(),
             target_lang,
             config.translation_api_type,
             config.openai_api_url.clone(),
             config.openai_model.clone(),
-            config.openai_system_prompt.clone()
+            config.openai_system_prompt.clone(),
+            config.translation_cache_size,
+            config.translation_batch_size,
+            config.translation_batch_delay_ms
         ))
     } else if config.translation_api_type == TranslationApiType::Demo {
         // Demo mode doesn't need an API key
         let target_lang = config.target_language.clone().unwrap_or_else(|| "zh-CN".to_string());
-        Some(create_translation_service(
+        Some(create_batch_translation_processor(
             "".to_string(),
             target_lang,
             TranslationApiType::Demo,
             None,
             None,
-            None
+            None,
+            config.translation_cache_size,
+            config.translation_batch_size,
+            config.translation_batch_delay_ms
         ))
     } else {
         warn!("Translation enabled but no API key provided");
         None
     };
     
-    if translation_service.is_none() {
-        return Err(AppError::Translation("Failed to create translation service".to_string()));
+    if translation_processor.is_none() {
+        return Err(AppError::Translation("Failed to create translation processor".to_string()));
     }
     
-    let translation_service = translation_service.unwrap();
+    let translation_processor = translation_processor.unwrap();
     
     // Set up Ctrl+C handler
     let ctrl_c = tokio::signal::ctrl_c();
@@ -2003,12 +2748,18 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
     
     // Clear screen and display window title
     print!("\x1B[2J\x1B[1;1H");
-    println!("Translation Window");
-    println!("  - Translation service: {}", translation_service.get_name());
-    println!("  - Target language: {}", translation_service.get_target_language());
+    println!("Translation Window (with Batch Processing and Caching)");
+    println!("  - Translation service: {}", translation_processor.service.get_name());
+    println!("  - Target language: {}", translation_processor.service.get_target_language());
+    println!("  - Cache size: {} entries", config.translation_cache_size);
+    println!("  - Batch size: {} texts", config.translation_batch_size);
+    println!("  - Batch delay: {}ms", config.translation_batch_delay_ms);
     println!("Press Ctrl+C to exit");
     println!("----------------------------------------");
     io::stdout().flush()?;
+    
+    // Create timer for periodic stats logging
+    let mut stats_timer = tokio::time::interval(Duration::from_secs(30));
     
     // Main loop
     loop {
@@ -2017,6 +2768,14 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
                 println!("\nReceived shutdown signal");
                 break;
             },
+            _ = stats_timer.tick() => {
+                // Log translation statistics
+                let (requests, batches, cache_hits, batch_sizes, hit_rate) = translation_processor.get_stats().await;
+                if requests > 0 {
+                    info!("Translation stats: {} requests, {} batches, {} cache hits, {:.1}% hit rate",
+                          requests, batches, cache_hits, hit_rate * 100.0);
+                }
+            },
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 // Check for new messages
                 match pipe.read_message() {
@@ -2024,7 +2783,7 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
                         debug!("Received text for translation [{}]: {}", id, content);
                         if !content.is_empty() {
                             if let Err(e) = translation_window.process_text_message(
-                                id, content, timestamp, is_complete, &translation_service
+                                id, content, timestamp, is_complete, &translation_processor
                             ).await {
                                 warn!("Translation failed: {}", e);
                             }
@@ -2032,6 +2791,12 @@ async fn run_translation_window(pipe_name: String) -> Result<(), AppError> {
                     },
                     Ok(IpcMessage::Shutdown) => {
                         info!("Received shutdown message");
+                        
+                        // Display final translation stats
+                        let (requests, batches, cache_hits, _, hit_rate) = translation_processor.get_stats().await;
+                        info!("Final translation stats: {} requests, {} batches, {} cache hits, {:.1}% hit rate",
+                              requests, batches, cache_hits, hit_rate * 100.0);
+                        
                         break;
                     },
                     Ok(_) => {
@@ -2181,6 +2946,9 @@ mod tests {
             active_interval_ms: 50,
             idle_interval_ms: 500,
             active_timeout_sec: 5.0,
+            translation_cache_size: 1000,
+            translation_batch_size: 5,
+            translation_batch_delay_ms: 500,
         };
         assert!(config.validate().is_ok());
         
@@ -2191,10 +2959,10 @@ mod tests {
         assert!(invalid_config.validate().is_err());
     }
     
-    /// Tests for sentence tracker
+    /// Tests for sentence tracker with batching
     #[test]
     fn test_sentence_tracker() {
-        let mut tracker = SentenceTracker::new();
+        let mut tracker = SentenceTracker::new(3, 500);
         
         // Test adding complete sentences
         let sentences = tracker.add_text("Hello. This is a test.");
@@ -2212,5 +2980,55 @@ mod tests {
         assert_eq!(sentences.len(), 1);
         assert_eq!(sentences[0].1, "This is incomplete and now complete.");
         assert_eq!(tracker.buffered_text, "");
+        
+        // Test batch formation
+        assert!(tracker.should_send_batch()); // We have 3 sentences now
+        let batch = tracker.get_pending_batch();
+        assert_eq!(batch.len(), 3);
+        
+        // Test marking batch as sent
+        let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
+        tracker.mark_batch_sent_for_translation(&ids);
+        
+        // Verify batch was marked as sent
+        assert!(!tracker.should_send_batch());
+        assert_eq!(tracker.get_pending_batch().len(), 0);
+    }
+    
+    /// Tests for translation cache
+    #[test]
+    fn test_translation_cache() {
+        let mut cache = TranslationCache::new(5);
+        
+        // Test cache miss
+        assert_eq!(cache.get("Hello"), None);
+        
+        // Test cache put and hit
+        cache.put("Hello".to_string(), "Hola".to_string());
+        assert_eq!(cache.get("Hello"), Some("Hola".to_string()));
+        
+        // Test cache stats
+        let (size, hits, misses, hit_rate) = cache.stats();
+        assert_eq!(size, 1);
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 1);
+        assert_eq!(hit_rate, 0.5);
+        
+        // Test LRU eviction
+        cache.put("One".to_string(), "Uno".to_string());
+        cache.put("Two".to_string(), "Dos".to_string());
+        cache.put("Three".to_string(), "Tres".to_string());
+        cache.put("Four".to_string(), "Cuatro".to_string());
+        cache.put("Five".to_string(), "Cinco".to_string());
+        
+        // Cache is full, this should evict "Hello"
+        cache.put("Six".to_string(), "Seis".to_string());
+        
+        // "Hello" should be evicted
+        assert_eq!(cache.get("Hello"), None);
+        
+        // Newer entries should still be present
+        assert_eq!(cache.get("One"), Some("Uno".to_string()));
+        assert_eq!(cache.get("Six"), Some("Seis".to_string()));
     }
 }
