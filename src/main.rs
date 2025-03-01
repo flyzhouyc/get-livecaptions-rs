@@ -771,13 +771,14 @@ impl BatchTranslationProcessor {
             for (text, mut senders) in current_queue.drain() {
                 if let Some(cached_translation) = cache_guard.get(&text) {
                     // Cache hit, respond immediately
+                    let sender_count = senders.len();
                     for sender in senders {
                         let _ = sender.send(Ok(cached_translation.clone()));
                     }
                     
                     // Update stats
                     let mut stats_guard = stats.lock().await;
-                    stats_guard.cache_hits += senders.len();
+                    stats_guard.cache_hits += sender_count;
                 } else if !senders.is_empty() {
                     // Cache miss, add to translation batch
                     if !text_to_senders.contains_key(&text) {
