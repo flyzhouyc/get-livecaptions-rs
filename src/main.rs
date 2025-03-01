@@ -1644,23 +1644,6 @@ struct PendingSentence {
 }
 
 /// Sentence tracker for maintaining sentence-level synchronization with batching support
-struct SentenceTracker {
-    next_id: u64,
-    pending_sentences: HashMap<u64, PendingSentence>,
-    buffered_text: String,
-    // New fields to support batching
-    batch_size: usize,
-    batch_timeout_ms: u64,
-    last_batch_time: u64,
-    // New field to track when text was last added
-    last_text_time: u64,
-}
-
-struct PendingSentence {
-    original: String,
-    timestamp: u64,
-    sent_for_translation: bool,
-}
 
 impl SentenceTracker {
     fn new(batch_size: usize, batch_timeout_ms: u64) -> Self {
@@ -1822,7 +1805,7 @@ impl SentenceTracker {
 }
 
 /// IPC messages for communication between processes
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 enum IpcMessage {
     /// Configuration message
     Config(Config),
@@ -2082,7 +2065,7 @@ impl TranslationWindow {
         for (_, sentence) in &self.sentences {
             // Format timestamp for display
             let time = Local.timestamp_millis_opt(sentence.timestamp as i64)
-                .unwrap_or_else(|| Local::now())
+                .unwrap_or(Local::now())
                 .format("%H:%M:%S").to_string();
             
             // Add original text with formatting
@@ -2121,7 +2104,7 @@ impl TranslationWindow {
             for (_, sentence) in &self.sentences {
                 // Format timestamp for display
                 let time = Local.timestamp_millis_opt(sentence.timestamp as i64)
-                    .unwrap_or_else(|| Local::now())
+                    .unwrap_or(Local::now())
                     .format("%H:%M:%S").to_string();
                 
                 self.displayed_text.push_str(&format!("[{}] [Original] {}\n", time, sentence.original));
@@ -2349,7 +2332,7 @@ impl Engine {
                         
                         // If we haven't exceeded max retries, queue for retry
                         if *retry_count < 5 {
-                            retries_needed.push(message);
+                            retries_needed.push(message.clone());
                             warn!("Message {} queued for retry ({}/5): {}", id, *retry_count, e);
                         } else {
                             warn!("Giving up on message {} after 5 retries", id);
@@ -2361,14 +2344,14 @@ impl Engine {
         }
         // Re-queue messages that need retry
         for message in retries_needed {
-            self.message_queue.push_back(message);
+            self.message_queue.push_back(message.clone());
         }
         Ok(())
     }
     fn queue_translation_message(&mut self, message: IpcMessage) {
         if let IpcMessage::Text { id, .. } = &message {
             // Add to the queue
-            self.message_queue.push_back(message);
+            self.message_queue.push_back(message.clone());
             
             // Initialize retry count
             self.message_retry_count.entry(*id).or_insert(0);
@@ -2512,7 +2495,7 @@ impl Engine {
                                 // Check if we should send incomplete sentences
                                 if self.sentence_tracker.should_send_incomplete() {
                                     if let Some((id, text)) = self.sentence_tracker.get_incomplete_sentence() {
-                                        if let Some(_pipe) = &self.translation_pipe {
+                                        if let Some(pipe) = &self.translation_pipe {
                                             debug!("Sending incomplete sentence for translation [{}]: {}", id, text);
                                             let message = IpcMessage::Text {
                                                 id,
@@ -2831,17 +2814,6 @@ impl Engine {
         info!("Shutdown complete");
         Ok(())
     }
-}
-
-/// Displays translation in a dedicated window
-fn display_translation_window(text: &str) -> Result<(), AppError> {
-    // Clear screen and move to top-left corner
-    print!("\x1B[2J\x1B[1;1H");
-    println!("Translation Window (with Batch Processing and Caching)");
-    println!("----------------------------------------");
-    println!("{}", text);
-    io::stdout().flush()?;
-    Ok(())
 }
 
 /// Runs the translation window process
