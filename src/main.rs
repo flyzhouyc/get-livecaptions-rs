@@ -1451,12 +1451,12 @@ fn default_min_interval() -> f64 { 0.5 }
 fn default_max_interval() -> f64 { 3.0 }
 fn default_max_text_length() -> usize { 10000 }
 fn default_ultra_responsive() -> bool { true }
-fn default_active_interval_ms() -> u64 { 50 }  // 50ms polling when active (very responsive)
+fn default_active_interval_ms() -> u64 { 30 }  // 50ms polling when active (very responsive)
 fn default_idle_interval_ms() -> u64 { 500 }   // 500ms polling when idle
 fn default_active_timeout_sec() -> f64 { 5.0 } // 5 seconds after last caption
-fn default_translation_cache_size() -> usize { 1000 } // Cache 1000 translations
-fn default_translation_batch_size() -> usize { 3 }   // Reduced from 5 to 3
-fn default_translation_batch_delay_ms() -> u64 { 300 } // Reduced from 500ms to 300ms
+fn default_translation_cache_size() -> usize { 2000 } // Cache 1000 translations
+fn default_translation_batch_size() -> usize { 5 }   // Reduced from 5 to 3
+fn default_translation_batch_delay_ms() -> u64 { 200 } // Reduced from 500ms to 300ms
 
 impl Config {
     /// Loads configuration from a file, creating a default if it doesn't exist
@@ -1666,48 +1666,59 @@ impl SentenceTracker {
         
         self.buffered_text.push_str(text);
         
-        // Extract complete sentences with improved detection
+        // Extract complete sentences with enhanced detection
         let mut complete_sentences = Vec::new();
         let mut sentence_start = 0;
         let chars: Vec<char> = self.buffered_text.chars().collect();
         
-        // Track potential sentence endings for more nuanced detection
+        // Track potential sentence breaks with more sensitivity
         let mut last_pause = 0;
+        let mut pause_count = 0;
         
         for i in 0..chars.len() {
-            // Standard sentence endings
+            // Enhanced sentence endings - add more boundary markers
             let is_sentence_end = chars[i] == '.' || chars[i] == '!' || chars[i] == '?' || 
-                                 chars[i] == ';' || // Add semicolon as a sentence boundary
-                                 (chars[i] == '\n' && i > 0 && chars[i-1] != '.');
+                                 chars[i] == ';' || chars[i] == ':' || // Added colon
+                                 (chars[i] == '\n') || // Any newline can be a sentence break
+                                 (chars[i] == '-' && i + 1 < chars.len() && chars[i+1] == ' '); // Dash followed by space
             
-            // Detect pauses that might indicate phrase boundaries (comma followed by space)
-            let is_pause = chars[i] == ',' && i + 1 < chars.len() && chars[i+1] == ' ';
+            // Enhanced pause detection - detect more types of pauses
+            let is_pause = (chars[i] == ',' && i + 1 < chars.len() && chars[i+1] == ' ') ||
+                          (chars[i] == ' ' && i > 0 && (chars[i-1] == ',' || chars[i-1] == ':'));
+            
             if is_pause {
                 last_pause = i;
+                pause_count += 1;
             }
             
-            // Detect long phrases without punctuation
-            let is_long_phrase = i - sentence_start > 80 && chars[i] == ' ' && 
-                                (last_pause == 0 || i - last_pause > 40);
+            // More sensitive long phrase detection - reduced thresholds
+            let is_long_phrase = (i - sentence_start > 50 && chars[i] == ' ') || // Reduced from 80 to 50
+                                 (pause_count >= 3 && i - sentence_start > 30 && chars[i] == ' ') || // Multiple pauses in shorter text
+                                 (i - sentence_start > 20 && chars[i] == ' ' && i + 1 < chars.len() && chars[i+1].is_uppercase()); // Space followed by capital letter
             
             if is_sentence_end || is_long_phrase {
-                // Found a sentence or long phrase ending
-                if i > sentence_start {
-                    let sentence = self.buffered_text[sentence_start..=i].to_string();
-                    let id = self.next_id;
-                    self.next_id += 1;
+                // Process the sentence if there's content
+                if i >= sentence_start {
+                    let sentence_end = if is_sentence_end { i } else { i - 1 };
+                    let sentence = self.buffered_text[sentence_start..=sentence_end].to_string();
                     
-                    // Store and prepare for sending
-                    self.pending_sentences.insert(id, PendingSentence {
-                        original: sentence.clone(),
-                        timestamp: Self::current_time_ms(),
-                        sent_for_translation: false,
-                    });
+                    // Skip empty or whitespace-only sentences
+                    if !sentence.trim().is_empty() {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        
+                        // Store and prepare for translation
+                        self.pending_sentences.insert(id, PendingSentence {
+                            original: sentence.clone(),
+                            timestamp: Self::current_time_ms(),
+                            sent_for_translation: false,
+                        });
+                        
+                        complete_sentences.push((id, sentence));
+                    }
                     
-                    complete_sentences.push((id, sentence));
                     sentence_start = i + 1;
-                    
-                    // Reset pause tracking for new sentence
+                    pause_count = 0;
                     last_pause = 0;
                 }
             }
@@ -1725,18 +1736,14 @@ impl SentenceTracker {
     
     /// Check if the current buffer should be sent even if incomplete
     fn should_send_incomplete(&self) -> bool {
-        // More aggressive criteria for sending incomplete sentences
-        // - Length threshold lowered from 100 to 30 characters
-        // - Time threshold lowered from 5000ms to 2000ms
-        // - Also send if we detect a likely pause in speech (silence for a period)
-        
-        self.buffered_text.len() > 30 || 
+        // Even more aggressive criteria
+        self.buffered_text.len() > 15 || // Reduced from 30 to 15 characters
         (!self.pending_sentences.is_empty() && 
          Self::current_time_ms() - self.pending_sentences.values()
-             .map(|s| s.timestamp).max().unwrap_or(0) > 2000) ||
-        // New condition: send buffered text if it's been accumulating for too long
+             .map(|s| s.timestamp).max().unwrap_or(0) > 1000) || // Reduced from 2000ms to 1000ms
+        // Send buffered text sooner
         (!self.buffered_text.is_empty() && 
-         Self::current_time_ms() - self.last_text_time > 1500)
+         Self::current_time_ms() - self.last_text_time > 750) // Reduced from 1500ms to 750ms
     }
     
     /// Get the current incomplete sentence for sending
@@ -2088,7 +2095,7 @@ impl TranslationWindow {
     
     /// Ensure the display doesn't get too long
     fn maintain_display_length(&mut self) {
-        const MAX_SENTENCES: usize = 25; // Increased from 10 to 25
+        const MAX_SENTENCES: usize = 50; // Increased from 10 to 25
         
         if self.sentences.len() > MAX_SENTENCES {
             // Remove oldest sentences
@@ -3109,12 +3116,12 @@ mod tests {
             openai_model: None,
             openai_system_prompt: None,
             ultra_responsive: true,
-            active_interval_ms: 50,
+            active_interval_ms: 30,
             idle_interval_ms: 500,
             active_timeout_sec: 5.0,
-            translation_cache_size: 1000,
+            translation_cache_size: 2000,
             translation_batch_size: 5,
-            translation_batch_delay_ms: 500,
+            translation_batch_delay_ms: 200,
         };
         assert!(config.validate().is_ok());
         
